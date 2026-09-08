@@ -632,9 +632,20 @@ func (p *LocalResolverProvider) flushAndPublishEvents(ctx context.Context) int {
 		return 0
 	}
 
-	if err := p.publishEvents(ctx, batch); err != nil {
+	eventCount := len(batch.Events)
+	rejected, err := p.publishEvents(ctx, batch)
+	if err != nil {
 		p.eventPublishFailures.Add(1)
 		p.logger.Debug("Failed to publish events", "error", err)
+		if recorder, ok := p.flagLogger.(interface {
+			RecordEventBatch(int, int, bool)
+		}); ok {
+			recorder.RecordEventBatch(eventCount, 0, false)
+		}
+	} else if recorder, ok := p.flagLogger.(interface {
+		RecordEventBatch(int, int, bool)
+	}); ok {
+		recorder.RecordEventBatch(eventCount-rejected, rejected, true)
 	}
 
 	if p.eventPublishAttempts.Add(1)%eventPublishLogWindow == 0 {
@@ -671,9 +682,9 @@ func (p *LocalResolverProvider) drainEvents(ctx context.Context) {
 
 // publishEvents wraps a flushed batch in a PublishEventsRequest and sends it to
 // the Confidence events service.
-func (p *LocalResolverProvider) publishEvents(ctx context.Context, batch *eventswasm.FlushEventsResponse) error {
+func (p *LocalResolverProvider) publishEvents(ctx context.Context, batch *eventswasm.FlushEventsResponse) (int, error) {
 	if p.eventsClient == nil {
-		return errors.New("events service client is not configured")
+		return 0, errors.New("events service client is not configured")
 	}
 
 	rpcCtx, cancel := context.WithTimeout(ctx, eventsPublishTimeout)
@@ -688,9 +699,10 @@ func (p *LocalResolverProvider) publishEvents(ctx context.Context, batch *events
 
 	response, err := p.eventsClient.PublishEvents(rpcCtx, request)
 	if err != nil {
-		return fmt.Errorf("failed to publish events: %w", err)
+		return 0, fmt.Errorf("failed to publish events: %w", err)
 	}
 
+	rejected := len(response.GetErrors())
 	for _, e := range response.GetErrors() {
 		p.logger.Error("Event publish error",
 			"index", e.GetIndex(),
@@ -698,7 +710,7 @@ func (p *LocalResolverProvider) publishEvents(ctx context.Context, batch *events
 			"message", e.GetMessage())
 	}
 
-	return nil
+	return rejected, nil
 }
 
 // Resolve resolves multiple flags for the given context. If flagNames is empty,
@@ -850,15 +862,11 @@ func (p *LocalResolverProvider) Shutdown() {
 	// Wait for background goroutines to exit
 	p.wg.Wait()
 
-	// Close resolver API (which flushes final logs)
-	if p.resolver != nil {
-		p.resolver.Close(ctx)
-		if p.logger != nil {
-			p.logger.Debug("Closed resolver API")
-		}
-	}
-
-	// Drain and close the event tracker
+	// Drain and close the event tracker BEFORE closing the resolver. Event
+	// delivery outcomes ride on the next WriteFlagLogs, so draining after the
+	// resolver's final flush would strand the last batch's
+	// published/rejected/succeeded/failed counters in process-local atomics.
+	// Java already orders it this way.
 	if p.eventTracker != nil {
 		drainCtx, drainCancel := context.WithTimeout(ctx, 3*time.Second)
 		p.drainEvents(drainCtx)
@@ -874,6 +882,15 @@ func (p *LocalResolverProvider) Shutdown() {
 		}
 		if p.logger != nil {
 			p.logger.Debug("Closed event tracker")
+		}
+	}
+
+	// Close resolver API (which flushes final logs, carrying the event
+	// counters drained above)
+	if p.resolver != nil {
+		p.resolver.Close(ctx)
+		if p.logger != nil {
+			p.logger.Debug("Closed resolver API")
 		}
 	}
 

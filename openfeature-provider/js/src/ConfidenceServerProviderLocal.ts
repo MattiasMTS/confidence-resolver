@@ -93,6 +93,12 @@ export class ConfidenceServerProviderLocal implements Provider {
   private readonly materializationStore: MaterializationStore | null;
   private readonly initLabels: Record<string, string>;
   private initTelemetryState: 'pending' | 'sending' | 'sent' = 'pending';
+  private flushSucceeded = 0;
+  private flushFailed = 0;
+  private eventsPublished = 0;
+  private eventBatchesSucceeded = 0;
+  private eventBatchesFailed = 0;
+  private eventsRejected = 0;
   private resolverInstance: LocalResolver | null = null;
   private eventTracker: EventTracker | null = null;
   private stateEtag: string | null = null;
@@ -232,6 +238,17 @@ export class ConfidenceServerProviderLocal implements Provider {
   async onClose(): Promise<void> {
     const signal = timeoutSignal(3000);
     try {
+      // Drain events BEFORE the final log flush. Event delivery outcomes are
+      // reported on the next WriteFlagLogs, so draining afterwards leaves the
+      // last batch's published/rejected/succeeded/failed counters stranded in
+      // process-local state. Java already orders it this way.
+      if (this.eventTracker) {
+        try {
+          await this.drainEvents(signal);
+        } catch {
+          // best-effort: provider is shutting down
+        }
+      }
       try {
         await this.flush(signal);
       } catch {
@@ -239,16 +256,9 @@ export class ConfidenceServerProviderLocal implements Provider {
       }
       if (this.initTelemetryState !== 'sent') {
         try {
-          const request = this.addProviderInitTelemetry(new Uint8Array());
+          const request = this.enrichTelemetry(new Uint8Array(), true);
           await this.sendFlagLogs(request, signal);
           this.initTelemetryState = 'sent';
-        } catch {
-          // best-effort: provider is shutting down
-        }
-      }
-      if (this.eventTracker) {
-        try {
-          await this.drainEvents(signal);
         } catch {
           // best-effort: provider is shutting down
         }
@@ -315,16 +325,24 @@ export class ConfidenceServerProviderLocal implements Provider {
         body: body as Uint8Array<ArrayBuffer>,
       });
       if (!response.ok) {
+        this.eventBatchesFailed++;
         logger.error(`Failed to send events: ${response.status} ${response.statusText}`);
         return;
       }
+      // Decode before recording anything: a 200 with an unreadable body is a
+      // failed batch, and counting success up front would let the catch below
+      // record the same batch as both succeeded and failed.
       const { errors } = PublishEventsResponse.decode(new Uint8Array(await response.arrayBuffer()));
+      this.eventBatchesSucceeded++;
+      this.eventsPublished += (batch.events?.length ?? 0) - errors.length;
+      this.eventsRejected += errors.length;
       for (const error of errors) {
         logger.error(
           `Failed to publish event at index ${error.index}: ${EventError_Reason[error.reason]} ${error.message}`,
         );
       }
     } catch (err) {
+      this.eventBatchesFailed++;
       logger.warn('Failed to send events:', err);
     }
   }
@@ -503,37 +521,84 @@ export class ConfidenceServerProviderLocal implements Provider {
     );
   }
 
+  /**
+   * Enriches, delivers and accounts for one WriteFlagLogs request. Shared by
+   * the interval flush and the per-evaluation assign flush so both are counted
+   * — Go's `Write` and Java's `writeLogs` count assign flushes too.
+   *
+   * Deliberately NOT serialised. `enrichTelemetry` and
+   * `restoreDrainedCounters` are both fully synchronous, so a drain cannot be
+   * interleaved and a restore is purely additive — counter totals are conserved
+   * under any interleaving. Serialising instead put every per-evaluation assign
+   * delivery on one chain, which is unbounded: a delivery can take 15s+ (3
+   * retries at 500ms plus a 5s timeout, across primary then fallback), so above
+   * ~1 evaluation per delivery the chain grows without bound and the interval
+   * flush starves behind it.
+   *
+   * Only the interval flush may carry provider-init telemetry: allowing both
+   * paths would let two concurrent requests each report an init.
+   */
+  private async deliverFlagLogs(
+    encodedWriteFlagLogRequest: Uint8Array,
+    allowInit: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const includeInit = allowInit && this.initTelemetryState === 'pending';
+    if (includeInit) {
+      this.initTelemetryState = 'sending';
+    }
+    const request = this.enrichTelemetry(encodedWriteFlagLogRequest, includeInit);
+    try {
+      const delivered = await this.sendFlagLogs(request, signal);
+      if (delivered) {
+        this.flushSucceeded++;
+      } else {
+        // Every destination answered non-OK: count the failure and put the
+        // drained delivery counters back so the next flush re-reports them.
+        this.flushFailed++;
+        this.restoreDrainedCounters(request);
+      }
+      // Provider init telemetry is best-effort and never retried after a
+      // response was received, successful or not.
+      if (includeInit) {
+        this.initTelemetryState = 'sent';
+      }
+    } catch (error) {
+      this.flushFailed++;
+      this.restoreDrainedCounters(request);
+      if (includeInit) {
+        this.initTelemetryState = 'pending';
+      }
+      throw error;
+    }
+  }
+
   // TODO should this return success/failure, or even throw?
   async flush(signal?: AbortSignal): Promise<void> {
-    let writeFlagLogRequest = this.resolver.flushLogs();
-    if (writeFlagLogRequest.length > 0) {
-      const includeInit = this.initTelemetryState === 'pending';
-      if (includeInit) {
-        this.initTelemetryState = 'sending';
-        writeFlagLogRequest = this.addProviderInitTelemetry(writeFlagLogRequest);
-      }
-      try {
-        await this.sendFlagLogs(writeFlagLogRequest, signal);
-        if (includeInit) {
-          this.initTelemetryState = 'sent';
-        }
-      } catch (error) {
-        if (includeInit) {
-          this.initTelemetryState = 'pending';
-        }
-        throw error;
-      }
-    }
+    const writeFlagLogRequest = this.resolver.flushLogs();
+    if (writeFlagLogRequest.length === 0) return;
+    await this.deliverFlagLogs(writeFlagLogRequest, true, signal);
   }
 
   private async flushAssigned(): Promise<void> {
     const writeFlagLogRequest = this.resolver.flushAssigned();
-    if (writeFlagLogRequest.length > 0) {
-      await this.sendFlagLogs(writeFlagLogRequest);
+    if (writeFlagLogRequest.length === 0) return;
+    try {
+      await this.deliverFlagLogs(writeFlagLogRequest, false, this.main.signal);
+    } catch (err) {
+      // Called unawaited from resolve's finally, so a rejection here would
+      // surface as an unhandled rejection in the host application.
+      logger.warn('Failed to flush assigned flag logs', err);
     }
   }
 
-  private async sendFlagLogs(encodedWriteFlagLogRequest: Uint8Array, signal = this.main.signal): Promise<void> {
+  /**
+   * Returns true when a destination accepted the payload, false when every
+   * destination answered with a non-OK response. Network-level failures on the
+   * last destination still throw, preserving the original contract that
+   * `flush()` rejects only on transport errors.
+   */
+  private async sendFlagLogs(encodedWriteFlagLogRequest: Uint8Array, signal = this.main.signal): Promise<boolean> {
     const destinations =
       this.logDestinations.length > 0 ? this.logDestinations : [LogDestination.LOG_DESTINATION_SPOTIFY_EDGE];
 
@@ -541,12 +606,13 @@ export class ConfidenceServerProviderLocal implements Provider {
       const isLast = i === destinations.length - 1;
       try {
         const ok = await this.sendFlagLogsToDestination(encodedWriteFlagLogRequest, destinations[i], signal);
-        if (ok) return;
+        if (ok) return true;
         // Non-OK response — try fallback if available
         if (!isLast) {
           logger.warn('Primary flag log destination returned error, trying fallback');
           continue;
         }
+        logger.warn('All flag log destinations returned error responses');
       } catch (err) {
         if (!isLast) {
           logger.warn('Primary flag log destination failed, trying fallback', err);
@@ -557,18 +623,70 @@ export class ConfidenceServerProviderLocal implements Provider {
         throw err;
       }
     }
+    return false;
   }
 
-  private addProviderInitTelemetry(encodedWriteFlagLogRequest: Uint8Array): Uint8Array {
+  private restoreDrainedCounters(encodedWriteFlagLogRequest: Uint8Array): void {
+    try {
+      const request = WriteFlagLogsRequest.decode(encodedWriteFlagLogRequest);
+      const td = request.telemetryData;
+      if (td?.flush) {
+        this.flushSucceeded += td.flush.succeeded;
+        this.flushFailed += td.flush.failed;
+      }
+      if (td?.events) {
+        this.eventsPublished += td.events.published;
+        this.eventBatchesSucceeded += td.events.batchesSucceeded;
+        this.eventBatchesFailed += td.events.batchesFailed;
+        this.eventsRejected += td.events.eventsRejected;
+      }
+    } catch {
+      // Best-effort restore — don't mask the original send error
+    }
+  }
+
+  /** Single decode→enrich→encode pass for init + delivery telemetry. */
+  private enrichTelemetry(encodedWriteFlagLogRequest: Uint8Array, includeInit: boolean): Uint8Array {
+    const hasFlush = this.flushSucceeded > 0 || this.flushFailed > 0;
+    const hasEvents =
+      this.eventsPublished > 0 ||
+      this.eventBatchesSucceeded > 0 ||
+      this.eventBatchesFailed > 0 ||
+      this.eventsRejected > 0;
+    if (!includeInit && !hasFlush && !hasEvents) {
+      return encodedWriteFlagLogRequest;
+    }
     const request = WriteFlagLogsRequest.decode(encodedWriteFlagLogRequest);
     if (!request.telemetryData) {
-      request.telemetryData = { resolverVersion: '', providerInitRate: [] };
+      request.telemetryData = {
+        resolverVersion: '',
+        providerInitRate: [],
+        resolveRate: [],
+        memoryBytes: 0,
+      };
     }
-    request.telemetryData.sdk = {
-      id: SdkId.SDK_ID_JS_LOCAL_SERVER_PROVIDER,
-      version: VERSION,
-    };
-    request.telemetryData.providerInitRate.push({ count: 1, labels: this.initLabels });
+    const td = request.telemetryData!;
+    if (includeInit) {
+      td.sdk = { id: SdkId.SDK_ID_JS_LOCAL_SERVER_PROVIDER, version: VERSION };
+      td.providerInitRate.push({ count: 1, labels: this.initLabels });
+    }
+    if (hasFlush) {
+      td.flush = { succeeded: this.flushSucceeded, failed: this.flushFailed };
+    }
+    if (hasEvents) {
+      td.events = {
+        published: this.eventsPublished,
+        batchesSucceeded: this.eventBatchesSucceeded,
+        batchesFailed: this.eventBatchesFailed,
+        eventsRejected: this.eventsRejected,
+      };
+    }
+    this.flushSucceeded = 0;
+    this.flushFailed = 0;
+    this.eventsPublished = 0;
+    this.eventBatchesSucceeded = 0;
+    this.eventBatchesFailed = 0;
+    this.eventsRejected = 0;
     return WriteFlagLogsRequest.encode(request).finish();
   }
 

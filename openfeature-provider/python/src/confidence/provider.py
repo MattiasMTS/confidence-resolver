@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
@@ -79,6 +79,26 @@ EVENTS_STATS_WINDOW = 10
 # flushes. Bounded because _send_events swallows network failures: an unbounded
 # loop would spin forever if the events API is unreachable during shutdown.
 MAX_EVENT_DRAIN_BATCHES = 100
+
+# Shutdown waits for the drained sends so their counters reach the final
+# WriteFlagLogs, but it must not inherit the steady-state timeout. _drain_events
+# can enqueue up to MAX_EVENT_DRAIN_BATCHES sends and the executor runs 2 at a
+# time, so waiting for all of them at EVENTS_PUBLISH_TIMEOUT would block for
+# 100 / 2 * 30s = 1500s (~25 min) during an events-service outage.
+#
+# Two bounds are needed, not one. A ceiling on the wait alone would expire
+# having recorded nothing, because every hung RPC still holds a worker for
+# 30s — which would defeat the point of waiting at all. Shortening the per-RPC
+# timeout as well lets a hung send fail fast enough that _send_events records
+# the failure inside the budget, so the final WriteFlagLogs still carries
+# batches_failed for it.
+#
+# Trade-off: counters from sends that do not finish inside the budget are lost.
+# That is the same trade _drain_events already makes with its enqueue deadline,
+# and far better than blocking shutdown for 25 minutes. Both values are sized
+# to match the 5s thread joins shutdown() already performs.
+EVENTS_SHUTDOWN_PUBLISH_TIMEOUT = 2.0
+EVENTS_SHUTDOWN_WAIT_BUDGET = 5.0
 
 # Retry transient UNAVAILABLE failures when publishing events. Scoped to the
 # events service so it cannot affect any other RPC on the channel.
@@ -284,6 +304,13 @@ class ConfidenceProvider(AbstractProvider):
         self._event_publish_attempts = 0
         self._event_publish_failures = 0
 
+        self._flush_succeeded = 0
+        self._flush_failed = 0
+        self._event_telemetry_published = 0
+        self._event_telemetry_succeeded = 0
+        self._event_telemetry_failed = 0
+        self._event_telemetry_rejected = 0
+
         # State fetcher (injected or created)
         self._state_fetcher = state_fetcher
 
@@ -439,23 +466,53 @@ class ConfidenceProvider(AbstractProvider):
             self._log_thread.join(timeout=5.0)
             self._log_thread = None
 
-        # Flush final logs
+        # Drain pending events BEFORE the final log flush. A single flush is
+        # capped inside the WASM, so anything beyond that cap needs further
+        # flushes or it is dropped. Draining first also matters for telemetry:
+        # event delivery outcomes ride on the next WriteFlagLogs, so draining
+        # after the final flush would strand the last batch's
+        # published/rejected/succeeded/failed counters in process-local state.
+        # Java already orders it this way.
+        drained: List["Future[None]"] = []
+        if self._event_tracker is not None:
+            try:
+                self._drain_events(
+                    sink=drained,
+                    publish_timeout=EVENTS_SHUTDOWN_PUBLISH_TIMEOUT,
+                )
+            except Exception as e:
+                logger.error("Failed to flush final events: %s", e)
+
+        # Reordering the drain call is not enough: _flush_events only SUBMITS to
+        # _event_executor, and _send_events increments the event telemetry
+        # counters on the worker thread. Wait for those sends here, or the final
+        # _write_logs below stamps counters that have not been recorded yet and
+        # the last batch's telemetry never leaves the process.
+        #
+        # The wait MUST be bounded. shutdown(wait=True) would block until every
+        # queued send finished — up to MAX_EVENT_DRAIN_BATCHES / 2 workers *
+        # EVENTS_PUBLISH_TIMEOUT, i.e. ~25 minutes during an outage. Wait on the
+        # drained futures with a ceiling instead, then tear the executor down
+        # without waiting and cancel whatever never started.
+        if drained:
+            _, not_done = wait_futures(drained, timeout=EVENTS_SHUTDOWN_WAIT_BUDGET)
+            if not_done:
+                logger.warning(
+                    "%d of %d final event sends did not finish within %.1fs; "
+                    "their delivery counters are lost",
+                    len(not_done),
+                    len(drained),
+                    EVENTS_SHUTDOWN_WAIT_BUDGET,
+                )
+        self._event_executor.shutdown(wait=False, cancel_futures=True)
+
+        # Flush final logs, carrying the event counters recorded above.
         if self._resolver is not None:
             try:
                 self._write_logs(self._resolver.flush_logs())
             except Exception as e:
                 logger.error("Failed to flush final logs: %s", e)
 
-        # Drain pending events. A single flush is capped inside the WASM, so
-        # anything beyond that cap needs further flushes or it is dropped.
-        if self._event_tracker is not None:
-            try:
-                self._drain_events()
-            except Exception as e:
-                logger.error("Failed to flush final events: %s", e)
-
-        # Shutdown event executor and gRPC channel
-        self._event_executor.shutdown(wait=True)
         if self._events_channel is not None:
             self._events_channel.close()
             self._events_channel = None
@@ -913,31 +970,124 @@ class ConfidenceProvider(AbstractProvider):
                 self._init_telemetry_state = "sending"
                 include_init = True
 
-        if include_init:
-            request = internal_api_pb2.WriteFlagLogsRequest.FromString(log_data)
-            request.telemetry_data.sdk.CopyFrom(
-                types_pb2.Sdk(
-                    id=types_pb2.SdkId.SDK_ID_PYTHON_PROVIDER,
-                    version=__version__,
-                )
+        with self._event_stats_lock:
+            has_flush = self._flush_succeeded > 0 or self._flush_failed > 0
+            has_events = (
+                self._event_telemetry_published > 0
+                or self._event_telemetry_succeeded > 0
+                or self._event_telemetry_failed > 0
+                or self._event_telemetry_rejected > 0
             )
-            init_rate = request.telemetry_data.provider_init_rate.add()
-            init_rate.count = 1
-            for k, v in self._init_labels.items():
-                init_rate.labels[k] = v
+        need_rewrite = include_init or has_flush or has_events
+
+        request = None
+        if need_rewrite:
+            request = internal_api_pb2.WriteFlagLogsRequest.FromString(log_data)
+            if include_init:
+                request.telemetry_data.sdk.CopyFrom(
+                    types_pb2.Sdk(
+                        id=types_pb2.SdkId.SDK_ID_PYTHON_PROVIDER,
+                        version=__version__,
+                    )
+                )
+                init_rate = request.telemetry_data.provider_init_rate.add()
+                init_rate.count = 1
+                for k, v in self._init_labels.items():
+                    init_rate.labels[k] = v
+            with self._event_stats_lock:
+                if has_flush:
+                    request.telemetry_data.flush.succeeded = self._flush_succeeded
+                    request.telemetry_data.flush.failed = self._flush_failed
+                    self._flush_succeeded = 0
+                    self._flush_failed = 0
+                if has_events:
+                    request.telemetry_data.events.published = (
+                        self._event_telemetry_published
+                    )
+                    request.telemetry_data.events.batches_succeeded = (
+                        self._event_telemetry_succeeded
+                    )
+                    request.telemetry_data.events.batches_failed = (
+                        self._event_telemetry_failed
+                    )
+                    request.telemetry_data.events.events_rejected = (
+                        self._event_telemetry_rejected
+                    )
+                    self._event_telemetry_published = 0
+                    self._event_telemetry_succeeded = 0
+                    self._event_telemetry_failed = 0
+                    self._event_telemetry_rejected = 0
             log_data = request.SerializeToString()
 
         try:
-            self._flag_logger.write(log_data)
+            future = self._flag_logger.write(log_data)
         except Exception:
+            # Failed to even submit the write.
+            self._record_flush_failure(request)
             if include_init:
                 with self._init_telemetry_lock:
                     self._init_telemetry_state = "pending"
             raise
+
+        if future is None:
+            # No delivery was attempted: an empty/skipped request, a dropping
+            # logger, or a custom logger predating the future contract. There
+            # is no outcome to wait for, so keep the optimistic accounting.
+            self._record_flush_success(include_init)
+            return
+
+        # write() only enqueues; the delivery happens on the logger's worker
+        # thread. Attribute the flush to the real outcome rather than to the
+        # enqueue, otherwise every flush counts as succeeded and flush_failed
+        # never reflects a network/HTTP failure.
+        future.add_done_callback(
+            lambda completed: self._on_flush_complete(completed, request, include_init)
+        )
+
+    def _on_flush_complete(
+        self,
+        future: "Future[bool]",
+        request: Optional[internal_api_pb2.WriteFlagLogsRequest],
+        include_init: bool,
+    ) -> None:
+        """Record the asynchronous delivery outcome of a flush.
+
+        Runs on the flag logger's worker thread.
+        """
+        try:
+            delivered = future.result()
+        except Exception:
+            delivered = False
+
+        if delivered:
+            self._record_flush_success(include_init)
         else:
+            self._record_flush_failure(request)
             if include_init:
                 with self._init_telemetry_lock:
-                    self._init_telemetry_state = "sent"
+                    self._init_telemetry_state = "pending"
+
+    def _record_flush_success(self, include_init: bool) -> None:
+        with self._event_stats_lock:
+            self._flush_succeeded += 1
+        if include_init:
+            with self._init_telemetry_lock:
+                self._init_telemetry_state = "sent"
+
+    def _record_flush_failure(
+        self, request: Optional[internal_api_pb2.WriteFlagLogsRequest]
+    ) -> None:
+        """Count the failed flush and restore the counters it had drained."""
+        with self._event_stats_lock:
+            self._flush_failed += 1
+            if request is not None:
+                td = request.telemetry_data
+                self._flush_succeeded += td.flush.succeeded
+                self._flush_failed += td.flush.failed
+                self._event_telemetry_published += td.events.published
+                self._event_telemetry_succeeded += td.events.batches_succeeded
+                self._event_telemetry_failed += td.events.batches_failed
+                self._event_telemetry_rejected += td.events.events_rejected
 
     def _create_flag_logger(
         self, account_id: str, log_destinations: List[int]
@@ -979,7 +1129,12 @@ class ConfidenceProvider(AbstractProvider):
             with self._resolver_lock:
                 log_data = self._resolver.flush_assigned()
             if log_data:
-                self._flag_logger.write(log_data)
+                # Route through _write_logs rather than calling the logger
+                # directly: assign flushes are real WriteFlagLogs deliveries, so
+                # they must be counted, carry the drained host counters, and
+                # restore them if delivery fails. Go's Write and Java's
+                # writeLogs already count assign flushes.
+                self._write_logs(log_data)
         except Exception as e:
             logger.error("Failed to flush assigned logs: %s", e)
 
@@ -1042,8 +1197,18 @@ class ConfidenceProvider(AbstractProvider):
                 "Failed to track event '%s'", tracking_event_name, exc_info=True
             )
 
-    def _flush_events(self) -> int:
+    def _flush_events(
+        self,
+        sink: Optional[List["Future[None]"]] = None,
+        publish_timeout: float = EVENTS_PUBLISH_TIMEOUT,
+    ) -> int:
         """Flush pending events from the event resolver and send them.
+
+        Args:
+            sink: When provided, the submitted Future is appended to it so the
+                caller can wait on the send. Shutdown uses this to bound its
+                wait; the periodic flush passes nothing and stays fire-and-forget.
+            publish_timeout: Per-RPC timeout handed to _send_events.
 
         Returns:
             The number of events handed off for publishing. A single flush is
@@ -1059,25 +1224,50 @@ class ConfidenceProvider(AbstractProvider):
         if not batch.events:
             return 0
 
-        self._event_executor.submit(self._send_events, batch)
+        try:
+            future = self._event_executor.submit(
+                self._send_events, batch, publish_timeout
+            )
+            if sink is not None:
+                sink.append(future)
+        except RuntimeError:
+            # shutdown() closes the executor before the final log flush, and the
+            # log thread is only joined with a timeout — so a slow thread can
+            # still reach here afterwards, where submit raises. Checking a flag
+            # first would not close the race, so swallow it: the process is
+            # going away and these events cannot be delivered either way.
+            logger.debug("Event executor already shut down; dropping batch")
+            return 0
         return len(batch.events)
 
-    def _drain_events(self, deadline_seconds: float = 3.0) -> None:
+    def _drain_events(
+        self,
+        deadline_seconds: float = 3.0,
+        sink: Optional[List["Future[None]"]] = None,
+        publish_timeout: float = EVENTS_PUBLISH_TIMEOUT,
+    ) -> None:
         """Flush events repeatedly until the event buffer is empty.
 
         A single flush is capped at 2 MB inside the WASM engine, so one flush
-        can leave a backlog behind. Bounded by both MAX_EVENT_DRAIN_BATCHES and
-        an overall deadline so shutdown never blocks indefinitely during an
-        outage.
+        can leave a backlog behind, hence the loop.
+
+        NOTE: deadline_seconds and MAX_EVENT_DRAIN_BATCHES bound only the
+        ENQUEUEING done here — _flush_events submits to the executor and
+        returns. They say nothing about how long the submitted sends take. Any
+        caller that then waits on those sends must bound its own wait; see
+        EVENTS_SHUTDOWN_WAIT_BUDGET and how shutdown() uses it.
+
+        Args:
+            deadline_seconds: Ceiling on time spent enqueueing.
+            sink: Collects the submitted Futures so a caller can wait on them.
+            publish_timeout: Per-RPC timeout handed to each send.
         """
         if self._event_tracker is None:
             return
 
-        import time
-
         deadline = time.monotonic() + deadline_seconds
         for _ in range(MAX_EVENT_DRAIN_BATCHES):
-            if self._flush_events() == 0:
+            if self._flush_events(sink=sink, publish_timeout=publish_timeout) == 0:
                 return
             if time.monotonic() >= deadline:
                 logger.warning(
@@ -1091,18 +1281,26 @@ class ConfidenceProvider(AbstractProvider):
             MAX_EVENT_DRAIN_BATCHES,
         )
 
-    def _send_events(self, batch: events_wasm_pb2.FlushEventsResponse) -> None:
+    def _send_events(
+        self,
+        batch: events_wasm_pb2.FlushEventsResponse,
+        publish_timeout: float = EVENTS_PUBLISH_TIMEOUT,
+    ) -> None:
         """Publish a batch of events to the Confidence events service over gRPC.
 
         Runs in the event executor thread pool.
 
         Args:
             batch: The FlushEventsResponse from the WASM flush.
+            publish_timeout: Per-RPC timeout. Shutdown passes a shorter value so
+                a hung send still fails inside the shutdown budget, letting its
+                failure be recorded rather than lost.
         """
         if self._events_stub is None:
             return
 
         failed = False
+        rejected = 0
         try:
             send_time = Timestamp()
             send_time.FromDatetime(datetime.now(timezone.utc))
@@ -1115,9 +1313,8 @@ class ConfidenceProvider(AbstractProvider):
                     version=__version__,
                 ),
             )
-            response = self._events_stub.PublishEvents(
-                request, timeout=EVENTS_PUBLISH_TIMEOUT
-            )
+            response = self._events_stub.PublishEvents(request, timeout=publish_timeout)
+            rejected = len(response.errors)
             for error in response.errors:
                 logger.error(
                     "Failed to publish event at index %d: %s %s",
@@ -1132,6 +1329,14 @@ class ConfidenceProvider(AbstractProvider):
         with self._event_stats_lock:
             if failed:
                 self._event_publish_failures += 1
+                self._event_telemetry_failed += 1
+            else:
+                # Events the service refused (unknown definition, schema
+                # mismatch) were delivered but not ingested, so they must not
+                # count as published.
+                self._event_telemetry_published += len(batch.events) - rejected
+                self._event_telemetry_succeeded += 1
+                self._event_telemetry_rejected += rejected
             self._event_publish_attempts += 1
             if self._event_publish_attempts % EVENTS_STATS_WINDOW == 0:
                 if self._event_publish_failures > 0:

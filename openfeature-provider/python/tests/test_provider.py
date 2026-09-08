@@ -1,10 +1,18 @@
 """Tests for ConfidenceProvider class."""
 
+import time
+
 from openfeature.evaluation_context import EvaluationContext
 from openfeature.exception import ErrorCode
 from openfeature.flag_evaluation import FlagResolutionDetails, Reason
 
-from confidence.provider import ConfidenceProvider
+from confidence.provider import (
+    EVENTS_SHUTDOWN_PUBLISH_TIMEOUT,
+    EVENTS_SHUTDOWN_WAIT_BUDGET,
+    ConfidenceProvider,
+)
+from confidence.proto.confidence.events.v1 import api_pb2 as events_api_pb2
+from confidence.proto.confidence.events.wasm.v1 import wasm_api_pb2 as events_wasm_pb2
 from confidence.proto.confidence.flags.resolver.v1 import internal_api_pb2, types_pb2
 from confidence.version import __version__
 from tests.conftest import MockFlagLogger, MockStateFetcher
@@ -96,6 +104,300 @@ class TestInitialize:
             mock_logger.writes[0]
         )
         assert len(decoded.telemetry_data.provider_init_rate) == 1
+
+    def test_flush_counted_failed_when_async_delivery_fails(
+        self,
+        wasm_bytes: bytes,
+        test_client_secret: str,
+    ) -> None:
+        """Flush accounting must follow the real delivery, not the enqueue.
+
+        Regression: write() only submits background work and the worker
+        swallowed delivery failures, so flush_succeeded incremented for every
+        flush while flush_failed and counter restoration never saw a
+        network/HTTP failure.
+        """
+        from concurrent.futures import Future
+
+        class FailingDeliveryLogger(MockFlagLogger):
+            def write(self, request_bytes: bytes):  # type: ignore[override]
+                super().write(request_bytes)
+                future: "Future[bool]" = Future()
+                future.set_result(False)  # enqueue OK, delivery failed
+                return future
+
+        provider = ConfidenceProvider(
+            client_secret=test_client_secret,
+            flag_logger=FailingDeliveryLogger(),
+            wasm_bytes=wasm_bytes,
+        )
+
+        # Counters the flush will drain into the request.
+        provider._flush_succeeded = 5
+        provider._flush_failed = 0
+        provider._event_telemetry_published = 40
+        provider._event_telemetry_succeeded = 2
+        provider._event_telemetry_failed = 1
+        provider._event_telemetry_rejected = 3
+
+        request = internal_api_pb2.WriteFlagLogsRequest()
+        request.flag_assigned.add()
+        provider._write_logs(request.SerializeToString())
+
+        # The failed flush is counted, and every drained counter is restored so
+        # the next flush re-reports it.
+        assert provider._flush_failed >= 1, "delivery failure was not counted"
+        assert provider._flush_succeeded == 5, "drained flush counter was not restored"
+        assert provider._event_telemetry_published == 40
+        assert provider._event_telemetry_succeeded == 2
+        assert provider._event_telemetry_failed == 1
+        assert provider._event_telemetry_rejected == 3
+
+    def test_flush_counted_succeeded_when_async_delivery_succeeds(
+        self,
+        wasm_bytes: bytes,
+        test_client_secret: str,
+    ) -> None:
+        """A delivered flush increments flush_succeeded and keeps counters drained."""
+        from concurrent.futures import Future
+
+        class SucceedingDeliveryLogger(MockFlagLogger):
+            def write(self, request_bytes: bytes):  # type: ignore[override]
+                super().write(request_bytes)
+                future: "Future[bool]" = Future()
+                future.set_result(True)
+                return future
+
+        provider = ConfidenceProvider(
+            client_secret=test_client_secret,
+            flag_logger=SucceedingDeliveryLogger(),
+            wasm_bytes=wasm_bytes,
+        )
+        provider._flush_succeeded = 0
+        provider._event_telemetry_published = 7
+
+        request = internal_api_pb2.WriteFlagLogsRequest()
+        request.flag_assigned.add()
+        provider._write_logs(request.SerializeToString())
+
+        assert provider._flush_succeeded == 1
+        assert provider._event_telemetry_published == 0, (
+            "counters were restored despite a successful delivery"
+        )
+
+    def test_assign_flush_is_counted_and_carries_drained_counters(
+        self,
+        wasm_bytes: bytes,
+        test_client_secret: str,
+    ) -> None:
+        """Assign flushes are real WriteFlagLogs deliveries and must be counted.
+
+        _flush_assigned previously called the logger directly and discarded the
+        Future, so assign-interval batches were neither counted nor included in
+        the host-counter drain. JS/Go/Java all count them.
+        """
+        from concurrent.futures import Future
+
+        class SucceedingDeliveryLogger(MockFlagLogger):
+            def write(self, request_bytes: bytes):  # type: ignore[override]
+                super().write(request_bytes)
+                future: "Future[bool]" = Future()
+                future.set_result(True)
+                return future
+
+        provider = ConfidenceProvider(
+            client_secret=test_client_secret,
+            flag_logger=SucceedingDeliveryLogger(),
+            wasm_bytes=wasm_bytes,
+        )
+        provider._flush_succeeded = 0
+        provider._event_telemetry_published = 11
+
+        request = internal_api_pb2.WriteFlagLogsRequest()
+        request.flag_assigned.add()
+        payload = request.SerializeToString()
+
+        class StubResolver:
+            def flush_assigned(self) -> bytes:
+                return payload
+
+        provider._resolver = StubResolver()  # type: ignore[assignment]
+
+        provider._flush_assigned()
+
+        assert provider._flush_succeeded == 1, (
+            "the assign-flush delivery was never counted"
+        )
+        assert provider._event_telemetry_published == 0, (
+            "assign flush did not carry the drained host counters"
+        )
+
+    def test_shutdown_stamps_last_event_batch_counters_on_final_flush(
+        self,
+        wasm_bytes: bytes,
+        test_client_secret: str,
+    ) -> None:
+        """The final WriteFlagLogs must actually CARRY the last batch's counters.
+
+        Asserting call order is not enough: _flush_events only submits to
+        _event_executor and _send_events increments the counters on a worker
+        thread, so calling _drain_events first still leaves the counters
+        unrecorded when the final _write_logs stamps the request. The executor
+        has to be drained between the two. This asserts the stamped values.
+        """
+        provider = ConfidenceProvider(
+            client_secret=test_client_secret,
+            flag_logger=MockFlagLogger(),
+            wasm_bytes=wasm_bytes,
+        )
+
+        event_count = 3
+
+        class StubEventTracker:
+            def __init__(self) -> None:
+                self.remaining = 1
+
+            def flush_events(self) -> events_wasm_pb2.FlushEventsResponse:
+                batch = events_wasm_pb2.FlushEventsResponse()
+                if self.remaining <= 0:
+                    return batch
+                self.remaining -= 1
+                for _ in range(event_count):
+                    batch.events.add().event_definition = "eventDefinitions/test"
+                return batch
+
+        class StubEventsStub:
+            def PublishEvents(self, request, timeout=None):  # noqa: N802
+                # Deliberately slow: _flush_events only SUBMITS to the executor,
+                # so without an explicit wait before the final flush the worker
+                # would still be in here when the counters are stamped. A fast
+                # stub races and can pass even with the bug present.
+                time.sleep(0.5)
+                # Accepted with no per-event rejections.
+                return events_api_pb2.PublishEventsResponse()
+
+        final_request = internal_api_pb2.WriteFlagLogsRequest()
+        final_request.flag_assigned.add()
+        final_payload = final_request.SerializeToString()
+
+        class StubResolver:
+            def flush_logs(self) -> bytes:
+                return final_payload
+
+            def flush_assigned(self) -> bytes:
+                return b""
+
+        provider._event_tracker = StubEventTracker()  # type: ignore[assignment]
+        provider._events_stub = StubEventsStub()  # type: ignore[assignment]
+        provider._resolver = StubResolver()  # type: ignore[assignment]
+
+        provider.shutdown()
+
+        writes = provider._flag_logger.writes  # type: ignore[union-attr]
+        assert writes, "no WriteFlagLogs was sent during shutdown"
+        stamped = [
+            internal_api_pb2.WriteFlagLogsRequest.FromString(w).telemetry_data.events
+            for w in writes
+        ]
+        published = sum(e.published for e in stamped)
+        succeeded = sum(e.batches_succeeded for e in stamped)
+
+        assert published == event_count, (
+            "the last event batch's published count never reached a "
+            f"WriteFlagLogs (got {published}, want {event_count}); the event "
+            "sends had not completed when the final flush stamped the request"
+        )
+        assert succeeded == 1, (
+            f"the last event batch's batches_succeeded was not stamped (got {succeeded})"
+        )
+
+    def test_shutdown_is_bounded_when_event_publishes_hang(
+        self,
+        wasm_bytes: bytes,
+        test_client_secret: str,
+    ) -> None:
+        """shutdown() must not block on the drained event sends indefinitely.
+
+        Waiting for those sends is deliberate — their counters have to reach the
+        final WriteFlagLogs — but the wait needs a ceiling. _drain_events can
+        enqueue MAX_EVENT_DRAIN_BATCHES sends against a 2-worker pool, so an
+        unbounded wait at EVENTS_PUBLISH_TIMEOUT blocks for ~25 minutes during
+        an events-service outage.
+
+        This also pins the shorter shutdown-path RPC timeout: with the
+        steady-state 30s timeout a hung send holds a worker past the budget, so
+        nothing gets recorded and the wait is pointless.
+        """
+        provider = ConfidenceProvider(
+            client_secret=test_client_secret,
+            flag_logger=MockFlagLogger(),
+            wasm_bytes=wasm_bytes,
+        )
+
+        batches = 2
+
+        class StubEventTracker:
+            def __init__(self) -> None:
+                self.remaining = batches
+
+            def flush_events(self) -> events_wasm_pb2.FlushEventsResponse:
+                batch = events_wasm_pb2.FlushEventsResponse()
+                if self.remaining <= 0:
+                    return batch
+                self.remaining -= 1
+                batch.events.add().event_definition = "eventDefinitions/test"
+                return batch
+
+        class HangingEventsStub:
+            """Blocks for the whole timeout, then fails like a real deadline.
+
+            It MUST block. _flush_events only submits to the executor, so a fast
+            stub lets the workers finish before the wait is even reached and the
+            bound is never exercised — such a test passes with the bound removed.
+            Sleeping for exactly the timeout the caller passed is what makes the
+            reverted state slow (30s) and the fixed state fast (2s).
+            """
+
+            def __init__(self) -> None:
+                self.timeouts: list = []
+
+            def PublishEvents(self, request, timeout=None):  # noqa: N802
+                self.timeouts.append(timeout)
+                time.sleep(timeout if timeout else 30.0)
+                raise RuntimeError("simulated deadline exceeded")
+
+        final_request = internal_api_pb2.WriteFlagLogsRequest()
+        final_request.flag_assigned.add()
+        final_payload = final_request.SerializeToString()
+
+        class StubResolver:
+            def flush_logs(self) -> bytes:
+                return final_payload
+
+            def flush_assigned(self) -> bytes:
+                return b""
+
+        stub = HangingEventsStub()
+        provider._event_tracker = StubEventTracker()  # type: ignore[assignment]
+        provider._events_stub = stub  # type: ignore[assignment]
+        provider._resolver = StubResolver()  # type: ignore[assignment]
+
+        started = time.monotonic()
+        provider.shutdown()
+        elapsed = time.monotonic() - started
+
+        # Budget plus generous slack for the surrounding shutdown work. The
+        # reverted state takes ~EVENTS_PUBLISH_TIMEOUT (30s), far beyond this.
+        ceiling = EVENTS_SHUTDOWN_WAIT_BUDGET + 4.0
+        assert elapsed < ceiling, (
+            f"shutdown blocked for {elapsed:.1f}s, over the {ceiling:.1f}s "
+            "ceiling; the wait on drained event sends is not bounded"
+        )
+        assert stub.timeouts, "no event send was attempted during shutdown"
+        assert all(t == EVENTS_SHUTDOWN_PUBLISH_TIMEOUT for t in stub.timeouts), (
+            "shutdown used the steady-state publish timeout "
+            f"instead of {EVENTS_SHUTDOWN_PUBLISH_TIMEOUT}s: {stub.timeouts}"
+        )
 
     def test_initialize_fetches_state(
         self,

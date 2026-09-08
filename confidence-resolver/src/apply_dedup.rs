@@ -3,6 +3,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::proto::confidence::flags::resolver::v1::events::FallthroughAssignment;
 use crate::proto::confidence::flags::resolver::v1::resolve_token_v1::AssignedFlag;
+use crate::proto::confidence::flags::resolver::v1::telemetry_data::ApplyDedupTelemetry;
 use crate::FlagToApply;
 
 const HASH_INIT: u64 = 0xCBF2_9CE4_8422_2325;
@@ -152,11 +153,95 @@ pub fn compute_dedup_hash(assigned: &AssignedFlag) -> u64 {
 /// iteration would repeat the O(n) scan.
 const SWEEP_MIN_INTERVAL_SECONDS: i64 = 10;
 
+/// Point-in-time snapshot of apply-dedup telemetry counters.
+///
+/// Counter fields are cumulative (monotonically increasing). Gauge fields
+/// (`map_size`, `map_capacity`) are latest values.
+///
+/// `serde(default)`: this is nested inside `TelemetrySnapshot`, which is
+/// persisted in Cloudflare KV and recovered with `unwrap_or_default()`. The
+/// parent's container-level default only rescues an absent `apply_dedup` key;
+/// an object that is present but missing a field a later version added would
+/// otherwise fail the whole snapshot parse, resetting every counter for that
+/// pipeline.
+#[derive(Clone, Default)]
+#[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
+pub struct ApplyDedupSnapshot {
+    pub applies_total: u64,
+    pub applies_deduped: u64,
+    #[cfg_attr(feature = "json", serde(alias = "overflow"))]
+    pub apply_dedup_overflow: u64,
+    pub sweeps: u64,
+    pub map_size: u32,
+    pub map_capacity: u32,
+}
+
+impl ApplyDedupSnapshot {
+    /// Compute a proto delta relative to a previous snapshot, using wrapping
+    /// subtraction for counters and latest values for gauges.
+    pub fn to_proto_delta(&self, previous: &ApplyDedupSnapshot) -> ApplyDedupTelemetry {
+        // The counters are u64 but the proto fields are uint32. Saturate rather
+        // than truncate: a bare `as u32` wraps a delta above u32::MAX back to a
+        // small number, silently under-reporting by ~4.29e9. Not reachable at a
+        // seconds-scale flush interval, but saturation costs nothing and errs
+        // visibly high instead of invisibly low.
+        let narrow = |delta: u64| u32::try_from(delta).unwrap_or(u32::MAX);
+        ApplyDedupTelemetry {
+            applies_total: narrow(self.applies_total.wrapping_sub(previous.applies_total)),
+            applies_deduped: narrow(self.applies_deduped.wrapping_sub(previous.applies_deduped)),
+            apply_dedup_overflow: narrow(
+                self.apply_dedup_overflow
+                    .wrapping_sub(previous.apply_dedup_overflow),
+            ),
+            sweeps: narrow(self.sweeps.wrapping_sub(previous.sweeps)),
+            map_size: self.map_size,
+            map_capacity: self.map_capacity,
+        }
+    }
+
+    pub fn has_activity(&self) -> bool {
+        self.applies_total > 0
+    }
+
+    /// The delta to attach to an outgoing request, or `None` when there is
+    /// genuinely nothing new to report.
+    ///
+    /// Callers MUST only commit `self` as the new "last reported" snapshot when
+    /// this returns `Some`. Advancing the baseline for a delta that was then
+    /// discarded loses those counts permanently — sweeps in particular, since
+    /// they keep running after the map has emptied and so produce deltas with
+    /// no applies and a zero `map_size`.
+    ///
+    /// Gauges are reported when they *change*, not merely when non-zero, so the
+    /// transition to an empty map is emitted once instead of the gauge sticking
+    /// at its last non-zero reading forever.
+    pub fn delta_to_report(&self, previous: &ApplyDedupSnapshot) -> Option<ApplyDedupTelemetry> {
+        let delta = self.to_proto_delta(previous);
+        let counters_moved = delta.applies_total > 0
+            || delta.applies_deduped > 0
+            || delta.apply_dedup_overflow > 0
+            || delta.sweeps > 0;
+        let gauges_changed =
+            self.map_size != previous.map_size || self.map_capacity != previous.map_capacity;
+
+        if counters_moved || gauges_changed {
+            Some(delta)
+        } else {
+            None
+        }
+    }
+}
+
 pub struct ApplyDedup {
     seen: HashMap<u64, i64, IdentityBuildHasher>,
     ttl_seconds: i64,
     max_entries: usize,
     last_sweep_seconds: i64,
+    applies_total: u64,
+    applies_deduped: u64,
+    apply_dedup_overflow: u64,
+    sweeps: u64,
 }
 
 impl ApplyDedup {
@@ -170,6 +255,21 @@ impl ApplyDedup {
             ttl_seconds,
             max_entries,
             last_sweep_seconds: 0,
+            applies_total: 0,
+            applies_deduped: 0,
+            apply_dedup_overflow: 0,
+            sweeps: 0,
+        }
+    }
+
+    pub fn telemetry_snapshot(&self) -> ApplyDedupSnapshot {
+        ApplyDedupSnapshot {
+            applies_total: self.applies_total,
+            applies_deduped: self.applies_deduped,
+            apply_dedup_overflow: self.apply_dedup_overflow,
+            sweeps: self.sweeps,
+            map_size: self.seen.len() as u32,
+            map_capacity: self.max_entries as u32,
         }
     }
 
@@ -190,14 +290,18 @@ impl ApplyDedup {
         let now_seconds = now_seconds.max(self.last_sweep_seconds);
         let mut keep = DedupResult::new(flags.len());
         for (i, fta) in flags.iter().enumerate() {
+            self.applies_total = self.applies_total.wrapping_add(1);
             let hash = compute_dedup_hash(fta.assigned_flag);
             // Presence means duplicate — stale entries are removed by sweep,
             // after which the flag gets re-logged on its next resolve.
             if self.seen.contains_key(&hash) {
+                self.applies_deduped = self.applies_deduped.wrapping_add(1);
                 continue;
             }
             if self.seen.len() < self.max_entries {
                 self.seen.insert(hash, now_seconds);
+            } else {
+                self.apply_dedup_overflow = self.apply_dedup_overflow.wrapping_add(1);
             }
             keep.mark(i);
         }
@@ -214,6 +318,7 @@ impl ApplyDedup {
             return;
         }
         self.last_sweep_seconds = now_seconds;
+        self.sweeps = self.sweeps.wrapping_add(1);
         let ttl = self.ttl_seconds;
         self.seen
             .retain(|_, ts| now_seconds.saturating_sub(*ts) < ttl);
@@ -1170,5 +1275,196 @@ mod tests {
 
         // sanity: cache holds all entries
         assert_eq!(dedup.seen.len(), total);
+    }
+
+    #[test]
+    fn telemetry_counters_basic() {
+        let mut dedup = ApplyDedup::new(120, 1000);
+        let flags = vec![
+            make_flag_to_apply("flags/a", "user1", "on"),
+            make_flag_to_apply("flags/b", "user1", "off"),
+        ];
+
+        dedup.filter_duplicates(&flags, 1000);
+        let snap = dedup.telemetry_snapshot();
+        assert_eq!(snap.applies_total, 2);
+        assert_eq!(snap.applies_deduped, 0);
+        assert_eq!(snap.apply_dedup_overflow, 0);
+        assert_eq!(snap.map_size, 2);
+        assert_eq!(snap.map_capacity, 1000);
+
+        // Same flags again — all deduped
+        dedup.filter_duplicates(&flags, 1001);
+        let snap = dedup.telemetry_snapshot();
+        assert_eq!(snap.applies_total, 4);
+        assert_eq!(snap.applies_deduped, 2);
+    }
+
+    /// Sweeps keep running after the map has emptied, producing deltas with no
+    /// applies and a zero map_size. Reporting must not skip those, or the sweep
+    /// counts are lost the moment the caller advances its baseline.
+    #[test]
+    fn sweep_only_delta_is_still_reported() {
+        let previous = ApplyDedupSnapshot {
+            applies_total: 10,
+            applies_deduped: 4,
+            apply_dedup_overflow: 0,
+            sweeps: 2,
+            map_size: 5,
+            map_capacity: 100,
+        };
+        // TTL has emptied the map: no new applies, but sweeps advanced.
+        let current = ApplyDedupSnapshot {
+            sweeps: 5,
+            map_size: 0,
+            ..previous
+        };
+
+        let delta = current
+            .delta_to_report(&previous)
+            .expect("a sweep-only delta must be reported, not discarded");
+
+        assert_eq!(delta.sweeps, 3, "sweep delta lost");
+        assert_eq!(delta.applies_total, 0);
+        assert_eq!(delta.map_size, 0, "gauge must be able to report zero");
+    }
+
+    /// Overflow-only movement must also be reported.
+    #[test]
+    fn overflow_only_delta_is_still_reported() {
+        let previous = ApplyDedupSnapshot {
+            applies_total: 7,
+            applies_deduped: 0,
+            apply_dedup_overflow: 1,
+            sweeps: 0,
+            map_size: 0,
+            map_capacity: 100,
+        };
+        let current = ApplyDedupSnapshot {
+            apply_dedup_overflow: 4,
+            ..previous
+        };
+
+        let delta = current
+            .delta_to_report(&previous)
+            .expect("an overflow-only delta must be reported");
+        assert_eq!(delta.apply_dedup_overflow, 3);
+    }
+
+    /// With nothing moving there is nothing to send, so the caller keeps its
+    /// baseline and no empty apply_dedup rides along on every flush.
+    #[test]
+    fn unchanged_snapshot_reports_nothing() {
+        let previous = ApplyDedupSnapshot {
+            applies_total: 3,
+            applies_deduped: 1,
+            apply_dedup_overflow: 0,
+            sweeps: 2,
+            map_size: 2,
+            map_capacity: 100,
+        };
+
+        assert!(
+            previous.delta_to_report(&previous).is_none(),
+            "an unchanged snapshot must not produce a delta"
+        );
+    }
+
+    /// A gauge moving back to a non-zero value is reported even with no counter
+    /// movement, so /metrics tracks map occupancy rather than freezing.
+    #[test]
+    fn gauge_change_alone_is_reported() {
+        let previous = ApplyDedupSnapshot {
+            applies_total: 5,
+            applies_deduped: 0,
+            apply_dedup_overflow: 0,
+            sweeps: 1,
+            map_size: 4,
+            map_capacity: 100,
+        };
+        let current = ApplyDedupSnapshot {
+            map_size: 1,
+            ..previous
+        };
+
+        let delta = current
+            .delta_to_report(&previous)
+            .expect("a changed gauge must be reported");
+        assert_eq!(delta.map_size, 1);
+        assert_eq!(delta.sweeps, 0);
+    }
+
+    #[test]
+    fn telemetry_overflow_when_full() {
+        let mut dedup = ApplyDedup::new(120, 2);
+
+        dedup.filter_duplicates(&[make_flag_to_apply("flags/a", "u1", "on")], 1000);
+        dedup.filter_duplicates(&[make_flag_to_apply("flags/b", "u1", "on")], 1000);
+        // Map is full — new entry passes through but is not cached
+        dedup.filter_duplicates(&[make_flag_to_apply("flags/c", "u1", "on")], 1000);
+
+        let snap = dedup.telemetry_snapshot();
+        assert_eq!(snap.applies_total, 3);
+        assert_eq!(snap.apply_dedup_overflow, 1);
+        assert_eq!(snap.map_size, 2);
+    }
+
+    #[test]
+    fn telemetry_sweep_counter() {
+        let mut dedup = ApplyDedup::new(10, 1000);
+        dedup.filter_duplicates(&[make_flag_to_apply("flags/a", "u1", "on")], 100);
+
+        dedup.sweep(105); // runs
+        dedup.sweep(112); // throttled
+        dedup.sweep(115); // runs
+
+        let snap = dedup.telemetry_snapshot();
+        assert_eq!(snap.sweeps, 2);
+    }
+
+    #[test]
+    fn telemetry_proto_delta() {
+        let mut dedup = ApplyDedup::new(120, 1000);
+        let flags = vec![make_flag_to_apply("flags/a", "user1", "on")];
+
+        dedup.filter_duplicates(&flags, 1000);
+        let snap1 = dedup.telemetry_snapshot();
+
+        dedup.filter_duplicates(&flags, 1001); // duplicate
+        dedup.filter_duplicates(&[make_flag_to_apply("flags/b", "u1", "on")], 1001);
+        let snap2 = dedup.telemetry_snapshot();
+
+        let delta = snap2.to_proto_delta(&snap1);
+        assert_eq!(delta.applies_total, 2); // 1 dup + 1 new
+        assert_eq!(delta.applies_deduped, 1);
+        assert_eq!(delta.map_size, 2);
+        assert_eq!(delta.map_capacity, 1000);
+    }
+
+    /// The counters are u64 and the proto fields uint32. A truncating `as u32`
+    /// wraps a delta above u32::MAX back to a small number, under-reporting by
+    /// ~4.29e9; saturation errs visibly high instead.
+    #[test]
+    fn to_proto_delta_saturates_instead_of_truncating() {
+        let previous = ApplyDedupSnapshot::default();
+        let current = ApplyDedupSnapshot {
+            applies_total: u64::from(u32::MAX) + 1,
+            applies_deduped: u64::from(u32::MAX) + 5,
+            apply_dedup_overflow: u64::from(u32::MAX) * 3,
+            sweeps: u64::from(u32::MAX) + 2,
+            map_size: 7,
+            map_capacity: 9,
+        };
+
+        let delta = current.to_proto_delta(&previous);
+
+        // Truncation would wrap these to 0, 4, MAX-2 and 1 respectively.
+        assert_eq!(delta.applies_total, u32::MAX);
+        assert_eq!(delta.applies_deduped, u32::MAX);
+        assert_eq!(delta.apply_dedup_overflow, u32::MAX);
+        assert_eq!(delta.sweeps, u32::MAX);
+        // Gauges are already u32 and pass through untouched.
+        assert_eq!(delta.map_size, 7);
+        assert_eq!(delta.map_capacity, 9);
     }
 }

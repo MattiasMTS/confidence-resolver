@@ -1,10 +1,13 @@
 use core::fmt;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
 use crate::ResolveReason;
+
+use crate::apply_dedup::ApplyDedupSnapshot;
 
 mod pb {
     pub use crate::proto::confidence::flags::resolver::v1::telemetry_data::{
@@ -105,16 +108,81 @@ impl Histogram {
 ///
 /// Used for delta computation between flushes and as the future intermediate
 /// representation for Prometheus text format serialization.
+///
+/// `serde(default)` is applied at the container level, not per field: this is
+/// persisted as JSON in Cloudflare KV and read back with `unwrap_or_default()`,
+/// so a field that a previously-deployed version never wrote must deserialize
+/// to its default rather than failing the whole parse. A failed parse silently
+/// resets every accumulated counter for that pipeline and drops the key from
+/// `/metrics`. Container level means any field added later is covered by
+/// construction; per-field attributes drift the moment someone forgets one.
+///
+/// Note an `Option` field is NOT exempt — serde distinguishes an absent field
+/// from an explicit `null`, and only the latter parses without a default.
 #[derive(Clone, Default)]
 #[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct TelemetrySnapshot {
     pub latency: HistogramSnapshot,
     pub resolve_rates: Vec<u64>,
     pub memory_bytes: u64,
+    pub apply_dedup: Option<ApplyDedupSnapshot>,
+    pub flush: FlushSnapshot,
+    pub events: EventsSnapshot,
+    /// Provider init counts, one entry per distinct label set, kept sorted by
+    /// labels so both the serialized snapshot and the Prometheus output are
+    /// deterministic.
+    pub provider_init_rate: Vec<ProviderInitSnapshot>,
 }
 
+/// Accumulated provider-init count for a single label set.
+///
+/// Modelled as a list entry rather than a map keyed by the label set, because
+/// the snapshot is serialized to JSON and JSON object keys must be strings.
+///
+/// `serde(default)` for the same reason as [`TelemetrySnapshot`], and it is
+/// needed here too: the container-level default on the parent only rescues an
+/// absent `provider_init_rate` key, not an entry that is present but missing a
+/// field a later version added. Without it such an entry fails the whole
+/// snapshot parse, which resets every counter for that pipeline.
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
+pub struct ProviderInitSnapshot {
+    pub labels: BTreeMap<String, String>,
+    pub count: u64,
+}
+
+/// `serde(default)`: persisted in KV and recovered with `unwrap_or_default()`,
+/// so a partial object written by an older deployment must default its missing
+/// fields rather than failing the whole snapshot parse.
 #[derive(Clone, Default)]
 #[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
+pub struct FlushSnapshot {
+    pub succeeded: u64,
+    pub failed: u64,
+}
+
+/// `serde(default)`: see [`FlushSnapshot`]. This struct has already gained a
+/// field once (`events_rejected`), so a partial object is the expected shape of
+/// anything written before that.
+#[derive(Clone, Default)]
+#[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
+pub struct EventsSnapshot {
+    pub published: u64,
+    pub batches_succeeded: u64,
+    pub batches_failed: u64,
+    pub events_rejected: u64,
+}
+
+/// `serde(default)`: see [`FlushSnapshot`]. This is the one nested snapshot
+/// that older deployments do write, so it is the most likely to be read back
+/// partial if a field is ever added.
+#[derive(Clone, Default)]
+#[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "json", serde(default))]
 pub struct HistogramSnapshot {
     pub sum: u64,
     pub count: u64,
@@ -177,16 +245,88 @@ impl TelemetrySnapshot {
         }
 
         for rate in &td.resolve_rate {
-            let idx = rate.reason as usize;
+            // `reason` is a plain proto i32 over an open enum, so an older,
+            // newer or buggy SDK can report a value outside the known range.
+            // A bare `as usize` would sign-extend -1 to ~1.8e19 and the
+            // resize() below would abort the process; a large positive would
+            // attempt a multi-gigabyte allocation. Bounded by REASON_COUNT the
+            // same way the bucket offsets above are bounded by BUCKET_COUNT.
+            let idx = match usize::try_from(rate.reason) {
+                Ok(i) if i < REASON_COUNT => i,
+                _ => continue, // skip unknown reason
+            };
             if idx >= self.resolve_rates.len() {
                 self.resolve_rates.resize(idx.saturating_add(1), 0);
             }
-            // Safety: we just resized to at least idx+1
+            // Safety: idx < REASON_COUNT and we just resized to at least idx+1
             self.resolve_rates[idx] = self.resolve_rates[idx].wrapping_add(rate.count as u64);
         }
 
         if td.memory_bytes > 0 {
             self.memory_bytes = td.memory_bytes;
+        }
+
+        if let Some(dedup) = &td.apply_dedup {
+            let ad = self
+                .apply_dedup
+                .get_or_insert_with(ApplyDedupSnapshot::default);
+            ad.applies_total = ad.applies_total.wrapping_add(dedup.applies_total as u64);
+            ad.applies_deduped = ad
+                .applies_deduped
+                .wrapping_add(dedup.applies_deduped as u64);
+            ad.apply_dedup_overflow = ad
+                .apply_dedup_overflow
+                .wrapping_add(dedup.apply_dedup_overflow as u64);
+            ad.sweeps = ad.sweeps.wrapping_add(dedup.sweeps as u64);
+            ad.map_size = dedup.map_size;
+            ad.map_capacity = dedup.map_capacity;
+        }
+
+        if let Some(flush) = &td.flush {
+            self.flush.succeeded = self.flush.succeeded.wrapping_add(flush.succeeded as u64);
+            self.flush.failed = self.flush.failed.wrapping_add(flush.failed as u64);
+        }
+
+        if let Some(events) = &td.events {
+            self.events.published = self.events.published.wrapping_add(events.published as u64);
+            self.events.batches_succeeded = self
+                .events
+                .batches_succeeded
+                .wrapping_add(events.batches_succeeded as u64);
+            self.events.batches_failed = self
+                .events
+                .batches_failed
+                .wrapping_add(events.batches_failed as u64);
+            self.events.events_rejected = self
+                .events
+                .events_rejected
+                .wrapping_add(events.events_rejected as u64);
+        }
+
+        // Provider init is reported by the host SDK, keyed by label set (e.g.
+        // {"encryption": "true"}). Counts for an existing label set add;
+        // a new label set is inserted keeping the list sorted so the
+        // serialized snapshot and Prometheus output stay deterministic.
+        for pir in &td.provider_init_rate {
+            match self
+                .provider_init_rate
+                .iter_mut()
+                .find(|entry| entry.labels == pir.labels)
+            {
+                Some(entry) => entry.count = entry.count.wrapping_add(pir.count as u64),
+                None => {
+                    let idx = self
+                        .provider_init_rate
+                        .partition_point(|entry| entry.labels < pir.labels);
+                    self.provider_init_rate.insert(
+                        idx,
+                        ProviderInitSnapshot {
+                            labels: pir.labels.clone(),
+                            count: pir.count as u64,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -215,6 +355,10 @@ impl TelemetrySnapshot {
         self.write_histogram(w, resolver_id, config)?;
         self.write_resolve_rates(w, resolver_id, config)?;
         self.write_memory(w, resolver_id, config)?;
+        self.write_apply_dedup(w, resolver_id, config)?;
+        self.write_flush(w, resolver_id, config)?;
+        self.write_events(w, resolver_id, config)?;
+        self.write_provider_init(w, resolver_id, config)?;
         if config.openmetrics {
             writeln!(w, "# EOF")?;
         }
@@ -354,6 +498,316 @@ impl TelemetrySnapshot {
             self.memory_bytes
         )
     }
+
+    fn write_apply_dedup(
+        &self,
+        w: &mut dyn fmt::Write,
+        resolver_id: &str,
+        config: &PrometheusConfig,
+    ) -> fmt::Result {
+        let ad = match &self.apply_dedup {
+            Some(ad) if ad.has_activity() => ad,
+            _ => return Ok(()),
+        };
+        let suffix = if config.openmetrics { ".0" } else { "" };
+
+        let type_name = if config.openmetrics {
+            "confidence_apply_dedup_applies"
+        } else {
+            "confidence_apply_dedup_applies_total"
+        };
+        writeln!(
+            w,
+            "# HELP {type_name} Total flag apply events processed by dedup."
+        )?;
+        writeln!(w, "# TYPE {type_name} counter")?;
+        writeln!(
+            w,
+            "confidence_apply_dedup_applies_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            ad.applies_total
+        )?;
+
+        let type_name = if config.openmetrics {
+            "confidence_apply_dedup_deduped"
+        } else {
+            "confidence_apply_dedup_deduped_total"
+        };
+        writeln!(w, "# HELP {type_name} Duplicate apply events filtered out.")?;
+        writeln!(w, "# TYPE {type_name} counter")?;
+        writeln!(
+            w,
+            "confidence_apply_dedup_deduped_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            ad.applies_deduped
+        )?;
+
+        let type_name = if config.openmetrics {
+            "confidence_apply_dedup_overflow"
+        } else {
+            "confidence_apply_dedup_overflow_total"
+        };
+        writeln!(
+            w,
+            "# HELP {type_name} Unique apply events that passed the dedup filter but could not be cached (map full)."
+        )?;
+        writeln!(w, "# TYPE {type_name} counter")?;
+        writeln!(
+            w,
+            "confidence_apply_dedup_overflow_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            ad.apply_dedup_overflow
+        )?;
+
+        let type_name = if config.openmetrics {
+            "confidence_apply_dedup_sweeps"
+        } else {
+            "confidence_apply_dedup_sweeps_total"
+        };
+        writeln!(
+            w,
+            "# HELP {type_name} Number of dedup map sweep operations."
+        )?;
+        writeln!(w, "# TYPE {type_name} counter")?;
+        writeln!(
+            w,
+            "confidence_apply_dedup_sweeps_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            ad.sweeps
+        )?;
+
+        writeln!(
+            w,
+            "# HELP confidence_apply_dedup_map_size Current entries in the dedup map."
+        )?;
+        writeln!(w, "# TYPE confidence_apply_dedup_map_size gauge")?;
+        writeln!(
+            w,
+            "confidence_apply_dedup_map_size{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            ad.map_size
+        )?;
+
+        writeln!(
+            w,
+            "# HELP confidence_apply_dedup_map_capacity Maximum entries allowed in the dedup map."
+        )?;
+        writeln!(w, "# TYPE confidence_apply_dedup_map_capacity gauge")?;
+        writeln!(
+            w,
+            "confidence_apply_dedup_map_capacity{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            ad.map_capacity
+        )
+    }
+
+    fn write_flush(
+        &self,
+        w: &mut dyn fmt::Write,
+        resolver_id: &str,
+        config: &PrometheusConfig,
+    ) -> fmt::Result {
+        if self.flush.succeeded == 0 && self.flush.failed == 0 {
+            return Ok(());
+        }
+        let suffix = if config.openmetrics { ".0" } else { "" };
+
+        let type_name = if config.openmetrics {
+            "confidence_flush_succeeded"
+        } else {
+            "confidence_flush_succeeded_total"
+        };
+        writeln!(
+            w,
+            "# HELP {type_name} Successful WriteFlagLogs batch deliveries."
+        )?;
+        writeln!(w, "# TYPE {type_name} counter")?;
+        writeln!(
+            w,
+            "confidence_flush_succeeded_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            self.flush.succeeded
+        )?;
+
+        let type_name = if config.openmetrics {
+            "confidence_flush_failed"
+        } else {
+            "confidence_flush_failed_total"
+        };
+        writeln!(
+            w,
+            "# HELP {type_name} Failed WriteFlagLogs batch deliveries."
+        )?;
+        writeln!(w, "# TYPE {type_name} counter")?;
+        writeln!(
+            w,
+            "confidence_flush_failed_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+            self.flush.failed
+        )
+    }
+
+    fn write_events(
+        &self,
+        w: &mut dyn fmt::Write,
+        resolver_id: &str,
+        config: &PrometheusConfig,
+    ) -> fmt::Result {
+        if self.events.published == 0
+            && self.events.batches_succeeded == 0
+            && self.events.batches_failed == 0
+            && self.events.events_rejected == 0
+        {
+            return Ok(());
+        }
+        let suffix = if config.openmetrics { ".0" } else { "" };
+
+        if self.events.published > 0 {
+            let type_name = if config.openmetrics {
+                "confidence_events_published"
+            } else {
+                "confidence_events_published_total"
+            };
+            writeln!(w, "# HELP {type_name} Total events published.")?;
+            writeln!(w, "# TYPE {type_name} counter")?;
+            writeln!(
+                w,
+                "confidence_events_published_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+                self.events.published
+            )?;
+        }
+
+        if self.events.batches_succeeded > 0 {
+            let type_name = if config.openmetrics {
+                "confidence_event_batches_succeeded"
+            } else {
+                "confidence_event_batches_succeeded_total"
+            };
+            writeln!(w, "# HELP {type_name} Successful event batch deliveries.")?;
+            writeln!(w, "# TYPE {type_name} counter")?;
+            writeln!(
+                w,
+                "confidence_event_batches_succeeded_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+                self.events.batches_succeeded
+            )?;
+        }
+
+        if self.events.batches_failed > 0 {
+            let type_name = if config.openmetrics {
+                "confidence_event_batches_failed"
+            } else {
+                "confidence_event_batches_failed_total"
+            };
+            writeln!(w, "# HELP {type_name} Failed event batch deliveries.")?;
+            writeln!(w, "# TYPE {type_name} counter")?;
+            writeln!(
+                w,
+                "confidence_event_batches_failed_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+                self.events.batches_failed
+            )?;
+        }
+
+        if self.events.events_rejected > 0 {
+            let type_name = if config.openmetrics {
+                "confidence_events_rejected"
+            } else {
+                "confidence_events_rejected_total"
+            };
+            writeln!(
+                w,
+                "# HELP {type_name} Total events rejected by the events service."
+            )?;
+            writeln!(w, "# TYPE {type_name} counter")?;
+            writeln!(
+                w,
+                "confidence_events_rejected_total{{resolver_id=\"{resolver_id}\"}} {}{suffix}",
+                self.events.events_rejected
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn write_provider_init(
+        &self,
+        w: &mut dyn fmt::Write,
+        resolver_id: &str,
+        config: &PrometheusConfig,
+    ) -> fmt::Result {
+        let has_any = self.provider_init_rate.iter().any(|e| e.count > 0);
+        if !has_any {
+            return Ok(());
+        }
+        let suffix = if config.openmetrics { ".0" } else { "" };
+
+        let type_name = if config.openmetrics {
+            "confidence_provider_init"
+        } else {
+            "confidence_provider_init_total"
+        };
+        writeln!(w, "# HELP {type_name} Total provider initializations.")?;
+        writeln!(w, "# TYPE {type_name} counter")?;
+        for entry in &self.provider_init_rate {
+            if entry.count == 0 {
+                continue;
+            }
+            // BTreeMap iteration is ordered by key, so the rendered label list
+            // is stable across runs.
+            let mut labels = String::new();
+            for (key, value) in &entry.labels {
+                // Label names arrive from an SDK-supplied `map<string, string>`
+                // and are never validated upstream. Unlike a bad label *value*,
+                // which escaping contains, a bad label *name* is a scrape-level
+                // parse error: Prometheus discards every metric from this
+                // resolver, not just this line. `__`-prefixed names are
+                // reserved (`__name__` would redefine the metric) and a second
+                // `resolver_id` is a duplicate-label error.
+                //
+                // Skip rather than sanitise. Rewriting `a-b` to `a_b` could
+                // fabricate a name that collides with a genuine label and
+                // silently merge two distinct series, which is harder to notice
+                // than a missing one.
+                if !is_valid_label_name(key) || key.starts_with("__") || key == "resolver_id" {
+                    continue;
+                }
+                labels.push(',');
+                labels.push_str(key);
+                labels.push_str("=\"");
+                labels.push_str(&escape_label_value(value));
+                labels.push('"');
+            }
+            writeln!(
+                w,
+                "confidence_provider_init_total{{resolver_id=\"{resolver_id}\"{labels}}} {}{suffix}",
+                entry.count
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// True if `name` is a valid Prometheus label name, i.e. matches
+/// `[a-zA-Z_][a-zA-Z0-9_]*`. Unlike a label value there is no escaping that
+/// makes an invalid name safe, so callers must skip it.
+fn is_valid_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Escape a Prometheus label value per the exposition format: backslash,
+/// double quote and line feed. Label values are SDK-supplied, so an
+/// unescaped quote would otherwise emit a malformed sample line and break
+/// the whole scrape.
+fn escape_label_value(value: &str) -> String {
+    if !value.contains(['\\', '"', '\n']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len().saturating_add(8));
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Concurrent telemetry collector.
@@ -420,6 +874,11 @@ impl Telemetry {
                 .map(|c| c.load(Ordering::Relaxed))
                 .collect(),
             memory_bytes: (self.memory_provider)(),
+            apply_dedup: None,
+            flush: FlushSnapshot::default(),
+            events: EventsSnapshot::default(),
+            // Reported by the host SDK, never by the in-WASM collector.
+            provider_init_rate: Vec::new(),
         }
     }
 
@@ -499,6 +958,9 @@ impl Telemetry {
             memory_bytes: (self.memory_provider)(),
             resolver_version: crate::version::VERSION.to_string(),
             provider_init_rate: Vec::new(),
+            apply_dedup: None,
+            flush: None,
+            events: None,
         }
     }
 }
@@ -1123,5 +1585,529 @@ mod tests {
         assert_eq!(snap.latency.sum, 100);
         let total: u64 = snap.latency.buckets.iter().sum();
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn accumulate_delta_with_apply_dedup() {
+        use crate::proto::confidence::flags::resolver::v1::telemetry_data::ApplyDedupTelemetry;
+
+        let mut snap = TelemetrySnapshot::default();
+        let td = pb::TelemetryData {
+            apply_dedup: Some(ApplyDedupTelemetry {
+                applies_total: 10,
+                applies_deduped: 3,
+                apply_dedup_overflow: 1,
+                sweeps: 2,
+                map_size: 50,
+                map_capacity: 100_000,
+            }),
+            ..Default::default()
+        };
+
+        snap.accumulate_delta(&td);
+        let ad = snap.apply_dedup.as_ref().unwrap();
+        assert_eq!(ad.applies_total, 10);
+        assert_eq!(ad.applies_deduped, 3);
+        assert_eq!(ad.apply_dedup_overflow, 1);
+        assert_eq!(ad.sweeps, 2);
+        assert_eq!(ad.map_size, 50);
+        assert_eq!(ad.map_capacity, 100_000);
+
+        // Second accumulation adds counters, replaces gauges
+        snap.accumulate_delta(&td);
+        let ad = snap.apply_dedup.as_ref().unwrap();
+        assert_eq!(ad.applies_total, 20);
+        assert_eq!(ad.applies_deduped, 6);
+        assert_eq!(ad.map_size, 50); // gauge, replaced
+    }
+
+    #[test]
+    fn prometheus_apply_dedup_metrics() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.apply_dedup = Some(ApplyDedupSnapshot {
+            applies_total: 100,
+            applies_deduped: 40,
+            apply_dedup_overflow: 5,
+            sweeps: 3,
+            map_size: 200,
+            map_capacity: 100_000,
+        });
+
+        let config = PrometheusConfig::default();
+        let prom = snap.to_prometheus("w0", &config);
+
+        assert!(prom.contains("# HELP confidence_apply_dedup_applies_total"));
+        assert!(prom.contains("# TYPE confidence_apply_dedup_applies_total counter"));
+        assert!(prom.contains(r#"confidence_apply_dedup_applies_total{resolver_id="w0"} 100"#));
+
+        assert!(prom.contains(r#"confidence_apply_dedup_deduped_total{resolver_id="w0"} 40"#));
+
+        assert!(prom.contains(r#"confidence_apply_dedup_overflow_total{resolver_id="w0"} 5"#));
+
+        assert!(prom.contains(r#"confidence_apply_dedup_sweeps_total{resolver_id="w0"} 3"#));
+
+        assert!(prom.contains(r#"confidence_apply_dedup_map_size{resolver_id="w0"} 200"#));
+        assert!(prom.contains("# TYPE confidence_apply_dedup_map_size gauge"));
+
+        assert!(prom.contains(r#"confidence_apply_dedup_map_capacity{resolver_id="w0"} 100000"#));
+        assert!(prom.contains("# TYPE confidence_apply_dedup_map_capacity gauge"));
+    }
+
+    #[test]
+    fn prometheus_no_dedup_when_none() {
+        let snap = TelemetrySnapshot::default();
+        let prom = snap.to_prometheus("w0", &PrometheusConfig::default());
+        assert!(!prom.contains("apply_dedup"));
+    }
+
+    #[test]
+    fn prometheus_flush_counters() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.flush.succeeded = 10;
+        snap.flush.failed = 2;
+
+        let config = PrometheusConfig::default();
+        let prom = snap.to_prometheus("w0", &config);
+
+        assert!(prom.contains(r#"confidence_flush_succeeded_total{resolver_id="w0"} 10"#));
+        assert!(prom.contains(r#"confidence_flush_failed_total{resolver_id="w0"} 2"#));
+    }
+
+    #[test]
+    fn accumulate_delta_flush_counters() {
+        use crate::proto::confidence::flags::resolver::v1::telemetry_data::FlushTelemetry;
+
+        let mut snap = TelemetrySnapshot::default();
+        let td = pb::TelemetryData {
+            flush: Some(FlushTelemetry {
+                succeeded: 5,
+                failed: 1,
+            }),
+            ..Default::default()
+        };
+
+        snap.accumulate_delta(&td);
+        assert_eq!(snap.flush.succeeded, 5);
+        assert_eq!(snap.flush.failed, 1);
+
+        snap.accumulate_delta(&td);
+        assert_eq!(snap.flush.succeeded, 10);
+        assert_eq!(snap.flush.failed, 2);
+    }
+
+    #[test]
+    fn accumulate_delta_event_counters() {
+        use crate::proto::confidence::flags::resolver::v1::telemetry_data::EventsTelemetry;
+
+        let mut snap = TelemetrySnapshot::default();
+        let td = pb::TelemetryData {
+            events: Some(EventsTelemetry {
+                published: 42,
+                batches_succeeded: 3,
+                batches_failed: 1,
+                events_rejected: 2,
+            }),
+            ..Default::default()
+        };
+
+        snap.accumulate_delta(&td);
+        assert_eq!(snap.events.published, 42);
+        assert_eq!(snap.events.batches_succeeded, 3);
+        assert_eq!(snap.events.batches_failed, 1);
+        assert_eq!(snap.events.events_rejected, 2);
+
+        snap.accumulate_delta(&td);
+        assert_eq!(snap.events.published, 84);
+        assert_eq!(snap.events.batches_succeeded, 6);
+        assert_eq!(snap.events.batches_failed, 2);
+        assert_eq!(snap.events.events_rejected, 4);
+    }
+
+    #[test]
+    fn events_rejected_alone_is_rendered() {
+        // A snapshot carrying only rejections must still produce output, so a
+        // batch that delivered but had every event refused is visible.
+        let mut snap = TelemetrySnapshot::default();
+        snap.events.events_rejected = 7;
+
+        let output = snap.to_prometheus("w0", &PrometheusConfig::default());
+
+        assert!(output.contains(r#"confidence_events_rejected_total{resolver_id="w0"} 7"#));
+    }
+
+    #[test]
+    fn openmetrics_with_all_telemetry() {
+        let tel = Telemetry::with_memory_provider(|| 1_048_576);
+        tel.record_latency_us(100);
+        tel.mark_resolve(ResolveReason::Match);
+
+        let mut snap = tel.snapshot();
+        snap.apply_dedup = Some(ApplyDedupSnapshot {
+            applies_total: 10,
+            applies_deduped: 3,
+            apply_dedup_overflow: 0,
+            sweeps: 1,
+            map_size: 5,
+            map_capacity: 100_000,
+        });
+        snap.flush.succeeded = 2;
+        snap.flush.failed = 1;
+        snap.events.published = 50;
+        snap.events.batches_succeeded = 4;
+        snap.events.batches_failed = 1;
+        snap.events.events_rejected = 3;
+
+        let config = PrometheusConfig {
+            openmetrics: true,
+            ..PrometheusConfig::default()
+        };
+        let output = snap.to_prometheus("w0", &config);
+
+        assert!(output.trim_end().ends_with("# EOF"));
+        let result = openmetrics_parser::openmetrics::parse_openmetrics(&output);
+        assert!(
+            result.is_ok(),
+            "OpenMetrics parser rejected output with all telemetry: {:?}\n\nRaw:\n{output}",
+            result.err()
+        );
+    }
+
+    // --- provider_init_rate -------------------------------------------------
+
+    fn provider_init_td(pairs: &[(&str, &str)], count: u32) -> pb::TelemetryData {
+        use crate::proto::confidence::flags::resolver::v1::telemetry_data::ProviderInitRate;
+
+        pb::TelemetryData {
+            provider_init_rate: vec![ProviderInitRate {
+                count,
+                labels: pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accumulate_delta_provider_init_same_labels_adds() {
+        let mut snap = TelemetrySnapshot::default();
+
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "true")], 1));
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "true")], 2));
+
+        assert_eq!(snap.provider_init_rate.len(), 1);
+        assert_eq!(snap.provider_init_rate[0].count, 3);
+    }
+
+    #[test]
+    fn accumulate_delta_provider_init_distinct_labels_kept_separate() {
+        let mut snap = TelemetrySnapshot::default();
+
+        // Insert out of order to prove the list ends up sorted by label set.
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "true")], 5));
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "false")], 7));
+
+        assert_eq!(snap.provider_init_rate.len(), 2);
+        assert_eq!(
+            snap.provider_init_rate[0].labels.get("encryption").unwrap(),
+            "false"
+        );
+        assert_eq!(snap.provider_init_rate[0].count, 7);
+        assert_eq!(
+            snap.provider_init_rate[1].labels.get("encryption").unwrap(),
+            "true"
+        );
+        assert_eq!(snap.provider_init_rate[1].count, 5);
+    }
+
+    #[test]
+    fn prometheus_provider_init_renders_labels() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "true")], 4));
+
+        let prom = snap.to_prometheus("w0", &PrometheusConfig::default());
+
+        assert!(prom.contains("# HELP confidence_provider_init_total"));
+        assert!(prom.contains("# TYPE confidence_provider_init_total counter"));
+        assert!(prom
+            .contains(r#"confidence_provider_init_total{resolver_id="w0",encryption="true"} 4"#));
+    }
+
+    #[test]
+    fn provider_init_alone_is_rendered() {
+        // A snapshot carrying only provider init must still produce output,
+        // otherwise the Cloudflare aggregation path stays silent about it.
+        let mut snap = TelemetrySnapshot::default();
+        snap.accumulate_delta(&provider_init_td(&[], 2));
+
+        let prom = snap.to_prometheus("w0", &PrometheusConfig::default());
+
+        assert!(prom.contains(r#"confidence_provider_init_total{resolver_id="w0"} 2"#));
+    }
+
+    #[test]
+    fn provider_init_zero_count_is_not_rendered() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "true")], 0));
+
+        let prom = snap.to_prometheus("w0", &PrometheusConfig::default());
+
+        assert!(!prom.contains("confidence_provider_init"));
+    }
+
+    #[test]
+    fn provider_init_label_value_is_escaped() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.accumulate_delta(&provider_init_td(&[("k", "a\"b\\c\nd")], 1));
+
+        let prom = snap.to_prometheus("w0", &PrometheusConfig::default());
+
+        assert!(prom.contains(r#"k="a\"b\\c\nd""#), "raw:\n{prom}");
+    }
+
+    #[test]
+    fn provider_init_openmetrics_output_parses() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "true")], 3));
+
+        let config = PrometheusConfig {
+            openmetrics: true,
+            ..PrometheusConfig::default()
+        };
+        let output = snap.to_prometheus("w0", &config);
+
+        let result = openmetrics_parser::openmetrics::parse_openmetrics(&output);
+        assert!(
+            result.is_ok(),
+            "OpenMetrics parser rejected provider init output: {:?}\n\nRaw:\n{output}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn provider_init_serde_round_trip() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.accumulate_delta(&provider_init_td(&[("encryption", "true")], 6));
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: TelemetrySnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.provider_init_rate.len(), 1);
+        assert_eq!(restored.provider_init_rate[0].count, 6);
+        assert_eq!(
+            restored.provider_init_rate[0]
+                .labels
+                .get("encryption")
+                .unwrap(),
+            "true"
+        );
+    }
+
+    /// A snapshot persisted by a deployment that predates every telemetry
+    /// field added here must still parse. Cloudflare reads KV with
+    /// `unwrap_or_default()`, so a parse failure is not loud — it silently
+    /// zeroes that pipeline's cumulative counters and drops the key from
+    /// `/metrics`.
+    ///
+    /// The payload deliberately contains ONLY the three fields that older
+    /// deployments wrote. Including the newer ones would exercise nothing.
+    #[test]
+    fn snapshot_from_older_deployment_still_deserializes() {
+        let json = r#"{
+            "latency": {"sum": 1, "count": 1, "buckets": [1]},
+            "resolve_rates": [2],
+            "memory_bytes": 3
+        }"#;
+
+        let restored: TelemetrySnapshot = serde_json::from_str(json)
+            .expect("a snapshot written by an older deployment must deserialize");
+
+        // Carried over from the persisted payload.
+        assert_eq!(restored.latency.sum, 1);
+        assert_eq!(restored.resolve_rates, vec![2]);
+        assert_eq!(restored.memory_bytes, 3);
+
+        // Absent fields default rather than failing the parse.
+        assert!(restored.provider_init_rate.is_empty());
+        assert!(restored.apply_dedup.is_none());
+        assert_eq!(restored.flush.succeeded, 0);
+        assert_eq!(restored.flush.failed, 0);
+        assert_eq!(restored.events.published, 0);
+        assert_eq!(restored.events.events_rejected, 0);
+    }
+
+    /// serde treats an absent field differently from an explicit `null`, so an
+    /// `Option` field is not automatically safe across versions.
+    #[test]
+    fn snapshot_with_apply_dedup_absent_rather_than_null_deserializes() {
+        let json = r#"{
+            "latency": {"sum": 0, "count": 0, "buckets": []},
+            "resolve_rates": [],
+            "memory_bytes": 0,
+            "flush": {"succeeded": 4, "failed": 5}
+        }"#;
+
+        let restored: TelemetrySnapshot = serde_json::from_str(json)
+            .expect("an absent apply_dedup must deserialize, not just an explicit null");
+
+        assert!(restored.apply_dedup.is_none());
+        assert_eq!(restored.flush.succeeded, 4);
+        assert_eq!(restored.events.published, 0);
+    }
+
+    /// Everything still round-trips, so adding container-level defaults has
+    /// not made the format lossy.
+    #[test]
+    fn full_snapshot_round_trips() {
+        let mut original = TelemetrySnapshot::default();
+        original.memory_bytes = 42;
+        original.flush.succeeded = 7;
+        original.events.events_rejected = 3;
+        original.provider_init_rate = vec![ProviderInitSnapshot {
+            labels: BTreeMap::from([("encryption".to_string(), "true".to_string())]),
+            count: 9,
+        }];
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: TelemetrySnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.memory_bytes, 42);
+        assert_eq!(restored.flush.succeeded, 7);
+        assert_eq!(restored.events.events_rejected, 3);
+        assert_eq!(restored.provider_init_rate.len(), 1);
+        assert_eq!(restored.provider_init_rate[0].count, 9);
+    }
+
+    /// Container-level `serde(default)` on the parent only rescues an ABSENT
+    /// nested key. A nested object that is present but partial — the shape a
+    /// deployment writes before a field is added to it — must also default
+    /// rather than failing the whole snapshot parse.
+    ///
+    /// Every payload below omits at least one field of the struct it
+    /// exercises; a payload containing all of them would assert nothing.
+    #[test]
+    fn partial_nested_objects_still_deserialize() {
+        let json = r#"{
+            "latency": {"sum": 11},
+            "flush": {"succeeded": 22},
+            "events": {"published": 33},
+            "apply_dedup": {"applies_total": 44},
+            "provider_init_rate": [{"count": 55}]
+        }"#;
+
+        let restored: TelemetrySnapshot = serde_json::from_str(json)
+            .expect("a partial nested object must deserialize, not fail the whole snapshot");
+
+        // Present fields survive.
+        assert_eq!(restored.latency.sum, 11);
+        assert_eq!(restored.flush.succeeded, 22);
+        assert_eq!(restored.events.published, 33);
+        assert_eq!(restored.apply_dedup.as_ref().unwrap().applies_total, 44);
+        assert_eq!(restored.provider_init_rate[0].count, 55);
+
+        // Omitted siblings default instead of erroring.
+        assert_eq!(restored.latency.count, 0);
+        assert!(restored.latency.buckets.is_empty());
+        assert_eq!(restored.flush.failed, 0);
+        assert_eq!(restored.events.batches_succeeded, 0);
+        assert_eq!(restored.events.events_rejected, 0);
+        assert_eq!(restored.apply_dedup.as_ref().unwrap().sweeps, 0);
+        assert_eq!(restored.apply_dedup.as_ref().unwrap().map_capacity, 0);
+        assert!(restored.provider_init_rate[0].labels.is_empty());
+    }
+
+    fn resolve_rate_td(reason: i32, count: u32) -> pb::TelemetryData {
+        pb::TelemetryData {
+            resolve_rate: vec![pb::ResolveRate { count, reason }],
+            ..Default::default()
+        }
+    }
+
+    /// `reason` is a plain proto i32 over an open enum. A bare `as usize`
+    /// sign-extends -1 to ~1.8e19, and the resize() would abort the process.
+    #[test]
+    fn accumulate_delta_negative_reason_skipped() {
+        let mut snap = TelemetrySnapshot::default();
+
+        snap.accumulate_delta(&resolve_rate_td(-1, 7));
+
+        let total: u64 = snap.resolve_rates.iter().sum();
+        assert_eq!(
+            total, 0,
+            "a negative reason must be skipped, not indexed or allocated for"
+        );
+    }
+
+    /// A large positive reason would attempt a multi-gigabyte allocation.
+    #[test]
+    fn accumulate_delta_oversized_reason_skipped() {
+        let mut snap = TelemetrySnapshot::default();
+
+        snap.accumulate_delta(&resolve_rate_td(2_000_000_000, 7));
+
+        let total: u64 = snap.resolve_rates.iter().sum();
+        assert_eq!(total, 0, "an out-of-range reason must be skipped");
+        assert!(
+            snap.resolve_rates.len() <= REASON_COUNT,
+            "the reasons vec must never grow past REASON_COUNT, got {}",
+            snap.resolve_rates.len()
+        );
+    }
+
+    /// The guard must not reject legitimate reasons.
+    #[test]
+    fn accumulate_delta_valid_reason_still_accumulates() {
+        let mut snap = TelemetrySnapshot::default();
+        let reason = ResolveReason::Match as i32;
+
+        snap.accumulate_delta(&resolve_rate_td(reason, 7));
+        snap.accumulate_delta(&resolve_rate_td(reason, 5));
+
+        assert_eq!(snap.resolve_rates[reason as usize], 12);
+    }
+
+    /// Label VALUES are escaped, but an invalid label NAME cannot be escaped
+    /// safe — Prometheus rejects the entire scrape, losing every metric from
+    /// this resolver rather than just this line.
+    #[test]
+    fn provider_init_invalid_label_names_are_skipped() {
+        let mut snap = TelemetrySnapshot::default();
+        snap.accumulate_delta(&provider_init_td(
+            &[
+                ("encryption-mode", "true"), // hyphen is invalid
+                ("0leading", "x"),           // may not start with a digit
+                ("has space", "x"),
+                ("__reserved", "x"),    // `__` prefix is reserved
+                ("resolver_id", "x"),   // would duplicate the built-in label
+                ("encryption", "true"), // valid, must survive
+            ],
+            1,
+        ));
+
+        let out = snap.to_prometheus("w0", &PrometheusConfig::default());
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("confidence_provider_init_total{"))
+            .expect("the sample line must still be rendered");
+
+        for bad in [
+            "encryption-mode",
+            "0leading",
+            "has space",
+            "__reserved",
+            "resolver_id=\"x\"",
+        ] {
+            assert!(
+                !line.contains(bad),
+                "invalid label name {bad:?} must be skipped, got: {line}"
+            );
+        }
+        assert!(
+            line.contains("encryption=\"true\""),
+            "a valid label alongside invalid ones must still render, got: {line}"
+        );
+        // Exactly one resolver_id, so the line is not a duplicate-label error.
+        assert_eq!(line.matches("resolver_id=").count(), 1);
     }
 }

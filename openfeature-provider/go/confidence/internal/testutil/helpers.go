@@ -52,6 +52,8 @@ func (m *MockFlagLogger) Write(request *resolverv1.WriteFlagLogsRequest) {
 	m.writeFunc(request)
 }
 
+func (m *MockFlagLogger) RecordEventBatch(publishedCount, rejectedCount int, succeeded bool) {}
+
 type StateProviderMock struct {
 	AccountID string
 	State     []byte
