@@ -6,6 +6,8 @@ require "json"
 require "uri"
 require "net/http"
 require "net/https"
+# Time.iso8601, used to coerce a String event_time.
+require "time"
 
 module Confidence
   module OpenFeature
@@ -20,10 +22,15 @@ module Confidence
       US = new("https://resolver.us.confidence.dev/v1")
     end
 
+    # The events API is a single global endpoint, unlike the regional
+    # resolver hosts above.
+    EVENTS_URI = "https://events.confidence.dev/v1"
+
     class APIClient
-      def initialize(client_secret:, region: Region::EU)
+      def initialize(client_secret:, region: Region::EU, events_uri: EVENTS_URI)
         @client_secret = client_secret
         @uri = URI.parse(region.uri)
+        @events_uri = URI.parse(events_uri)
       end
 
       def resolve_one(flag:, context: {}, apply: true)
@@ -38,6 +45,41 @@ module Confidence
         result
       end
 
+      # Publishes a single event to the Confidence events API.
+      #
+      # +event_name+ is the event definition id, sent as
+      # "eventDefinitions/#{event_name}". +payload+ is an arbitrary hash.
+      # +event_time+ defaults to now; pass it to backdate an event.
+      #
+      # Returns nil on success. Raises APIError if the request itself fails
+      # and EventPublishError if the batch is accepted but the event is
+      # refused, so rejections are never silently discarded.
+      def track(event_name:, payload: {}, event_time: nil)
+        now = Time.now
+        result = post_json("/v1/events:publish", {
+          clientSecret: @client_secret,
+          sendTime: rfc3339(now),
+          sdk: {id: "SDK_ID_RUBY_PROVIDER", version: VERSION},
+          events: [{
+            eventDefinition: "eventDefinitions/#{event_name}",
+            eventTime: rfc3339(event_time || now),
+            payload: payload || {}
+          }]
+        }, uri: @events_uri, label: "events:publish")
+
+        rejections = (result["errors"] || []).map do |error|
+          Rejection.new(error["index"], error["reason"], error["message"])
+        end
+        unless rejections.empty?
+          raise EventPublishError.new(
+            "events:publish refused #{rejections.length} event(s): " +
+              rejections.map { |r| "[#{r.index}] #{r.reason} #{r.message}".strip }.join(", "),
+            rejections
+          )
+        end
+        nil
+      end
+
       def resolve(flags: [], context: {}, apply: true)
         result = post_json("/v1/flags:resolve", {
           clientSecret: @client_secret,
@@ -45,7 +87,7 @@ module Confidence
           apply: apply,
           flags: flags,
           sdk: {id: "SDK_ID_RUBY_PROVIDER", version: VERSION}
-        })
+        }, uri: @uri, label: "flags:resolve")
 
         resolved_flags = result["resolvedFlags"] || []
         resolved_flags.map do |flag|
@@ -81,21 +123,57 @@ module Confidence
         agent
       end
 
-      def post_json(path, body)
+      # getutc rather than utc: the latter mutates its receiver, which would
+      # convert a caller-supplied event_time to UTC in place.
+      #
+      # Accepts a String as well as a Time. Spec 6.2.2 permits string custom
+      # fields, and an "event_time" entry in tracking event details is the only
+      # route to set the event time through the spec-conformant +track+, so a
+      # caller passing an ISO-8601 string is expected rather than exceptional.
+      # An unparseable value raises TypeMismatchError rather than falling back
+      # to "now": a silently wrong timestamp is harder to diagnose than a
+      # logged failure, and +track+ turns the raise into a warning.
+      def rfc3339(time)
+        coerce_time(time).getutc.strftime("%Y-%m-%dT%H:%M:%S.%LZ")
+      end
+
+      def coerce_time(time)
+        return time if time.is_a?(Time)
+
+        if time.is_a?(String)
+          begin
+            return Time.iso8601(time)
+          rescue ArgumentError => ex
+            raise TypeMismatchError.new(
+              "event_time #{time.inspect} is not a valid ISO-8601 timestamp: #{ex.message}"
+            )
+          end
+        end
+
+        raise TypeMismatchError.new(
+          "event_time must be a Time or an ISO-8601 String, got #{time.class}"
+        )
+      end
+
+      # Takes the target URI rather than a prepared agent so that every request
+      # still builds its own, per build_agent above. +label+ names the endpoint
+      # in errors; both callers pass it explicitly, which keeps "which host does
+      # this go to" a decision at the call site.
+      def post_json(path, body, uri:, label:)
         headers = {"Content-Type" => "application/json"}
         request = Net::HTTP::Post.new(path, headers)
         request.body = JSON.dump(body)
-        response = build_agent(@uri).request(request)
+        response = build_agent(uri).request(request)
 
         code = response.code.to_i
         if code != 200
-          raise APIError.new("flags:resolve HTTP #{response.code} #{response.message}")
+          raise APIError.new("#{label} HTTP #{response.code} #{response.message}")
         end
 
         begin
           JSON.parse(response.body)
         rescue JSON::ParserError => ex
-          raise APIError.new("flags:resolve malformed JSON: #{ex}")
+          raise APIError.new("#{label} malformed JSON: #{ex}")
         end
       end
 
@@ -109,6 +187,9 @@ module Confidence
         variant.nil? || value.nil?
       end
     end
+
+    # A single event the events API refused within an accepted batch.
+    Rejection = Struct.new(:index, :reason, :message)
   end
 end
 

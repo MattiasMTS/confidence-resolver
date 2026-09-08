@@ -160,6 +160,88 @@ if details.error_code
 end
 ```
 
+## Event Tracking
+
+Events are published to the Confidence events API. `track` follows the
+OpenFeature tracking specification (requirement 6.1.1.1), so it takes the
+tracking event name positionally and returns nothing:
+
+```ruby
+provider.track(
+  "checkout-completed",
+  evaluation_context: ::OpenFeature::SDK::EvaluationContext.new(targeting_key: "user-1"),
+  tracking_event_details: {"value" => 12.5, "cart_size" => 3}
+)
+```
+
+The event name is the event definition id and is sent as
+`eventDefinitions/<name>`.
+
+### Payload shape
+
+Matching the other Confidence SDKs, `tracking_event_details` become top-level
+payload fields and the evaluation context is nested under a reserved `context`
+key:
+
+```json
+{ "value": 12.5, "cart_size": 3, "context": { "targeting_key": "user-1" } }
+```
+
+Per the spec, `value` is an optional numeric field and other custom fields may
+be `boolean | string | number | structure`. Details keys are stringified. An
+`event_time` entry (a `Time`) backdates the event and is removed from the
+payload rather than published as a custom field.
+
+Because details may not shadow the context, passing a `context` key raises
+`InvalidContextInPayloadError` rather than silently overwriting one with the
+other.
+
+### Error handling: `track` vs `track!`
+
+`track` never raises. The OpenFeature SDK client does not rescue around
+tracking, so an exception would surface in application code from a
+fire-and-forget call; failures are written to stderr instead.
+
+Use `track!` when you want failures raised:
+
+```ruby
+begin
+  provider.track!("checkout-completed", tracking_event_details: {"cart_size" => 3})
+rescue Confidence::OpenFeature::EventPublishError => e
+  e.rejections.each do |rejection|
+    Rails.logger.error("event #{rejection.index} refused: #{rejection.reason}")
+  end
+end
+```
+
+- `APIError` if the request itself fails, for example an invalid client secret.
+- `EventPublishError` if the batch is accepted but the event is refused. The
+  events API returns HTTP 200 in that case, so these rejections would otherwise
+  be invisible. Inspect `rejections` for the index, reason (such as
+  `EVENT_DEFINITION_NOT_FOUND` or `EVENT_SCHEMA_VALIDATION_FAILED`) and message.
+- `InvalidContextInPayloadError` on a reserved-key collision, and
+  `TypeMismatchError` if `value` is not numeric.
+
+### Calling through the OpenFeature client
+
+Tracking routes through the OpenFeature client, which merges the evaluation
+context for you (requirement 6.1.3):
+
+```ruby
+OpenFeature::SDK.set_provider(provider)
+client = OpenFeature::SDK.build_client
+
+client.track("checkout-completed", tracking_event_details: {"value" => 12.5})
+```
+
+Client-level tracking requires openfeature-sdk >= 0.6.1, which this gem now
+depends on. That SDK requires **Ruby >= 3.4**, so this gem does too.
+
+Note that `OpenFeature::SDK.set_provider` initializes the provider on a
+background thread, and from SDK 0.6.1 the client short-circuits evaluation to
+the default value while a tracked provider is still `NOT_READY`. Use
+`set_provider_and_wait` if you need the first evaluations to hit Confidence.
+
 ## Shutdown
 
 **Important**: The provider makes network calls for each flag evaluation. Always ensure proper shutdown to close connections gracefully.
