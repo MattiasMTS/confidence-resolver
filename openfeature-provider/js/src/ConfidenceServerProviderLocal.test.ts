@@ -11,6 +11,8 @@ import { sha256Hex } from './hash';
 import { ResolveReason } from './proto/confidence/flags/resolver/v1/types';
 import { WriteFlagLogsRequest } from './proto/test-only';
 import { VERSION } from './version';
+// Type-only: pins the README's documented entry point without loading its WASM.
+import type * as NodeEntry from './index.node';
 
 vi.mock(import('./hash'), async () => {
   const { sha256Hex } = await import('./test-helpers');
@@ -765,5 +767,70 @@ describe('getPrometheusMetrics', () => {
 
     expect(mockedWasmResolver.prometheusSnapshot).toHaveBeenCalledWith('0');
     expect(result).toBe('# HELP some_metric\nsome_metric 42\n');
+  });
+});
+
+describe('apply-event dedup', () => {
+  it('is enabled when the option is not set', async () => {
+    // The shared provider from beforeEach never mentions enableApplyDedup, so
+    // this asserts the default that ships — not a value the test supplied.
+    await advanceTimersUntil(expect(provider.initialize()).resolves.toBeUndefined());
+
+    expect(mockedWasmResolver.setResolverState).toHaveBeenCalledWith(
+      expect.objectContaining({ enableApplyDedup: true }),
+    );
+  });
+
+  it('is disabled when the option is set to false', async () => {
+    const optedOut = new ConfidenceServerProviderLocal(mockedWasmResolver, noopEventTracker, {
+      flagClientSecret: 'flagClientSecret',
+      fetch: net.fetch,
+      materializationStore: 'CONFIDENCE_REMOTE_STORE',
+      enableApplyDedup: false,
+    });
+
+    await advanceTimersUntil(expect(optedOut.initialize()).resolves.toBeUndefined());
+
+    expect(mockedWasmResolver.setResolverState).toHaveBeenCalledWith(
+      expect.objectContaining({ enableApplyDedup: false }),
+    );
+
+    await optedOut.onClose?.();
+  });
+
+  it('is enabled when the option is set to true', async () => {
+    const optedIn = new ConfidenceServerProviderLocal(mockedWasmResolver, noopEventTracker, {
+      flagClientSecret: 'flagClientSecret',
+      fetch: net.fetch,
+      materializationStore: 'CONFIDENCE_REMOTE_STORE',
+      enableApplyDedup: true,
+    });
+
+    await advanceTimersUntil(expect(optedIn.initialize()).resolves.toBeUndefined());
+
+    expect(mockedWasmResolver.setResolverState).toHaveBeenCalledWith(
+      expect.objectContaining({ enableApplyDedup: true }),
+    );
+
+    await optedIn.onClose?.();
+  });
+
+  // The tests above construct the provider directly, which is right for them
+  // but means they cannot catch a README snippet that calls the wrong entry
+  // point — exactly how an uncompilable opt-out example shipped. The README
+  // documents `createConfidenceServerProvider({ ... })`, so pin that call
+  // shape here. The import is type-only: the real entry point loads WASM at
+  // call time and has no place in this suite, but `tsc` still fails if the
+  // factory is renamed, its parameter shape changes, or `enableApplyDedup`
+  // stops being an accepted option.
+  it('typechecks the opt-out exactly as the README documents it', () => {
+    type ReadmeFactoryOptions = Parameters<typeof NodeEntry.createConfidenceServerProvider>[0];
+
+    const readmeSnippet: ReadmeFactoryOptions = {
+      flagClientSecret: 'your-client-secret',
+      enableApplyDedup: false,
+    };
+
+    expect(readmeSnippet.enableApplyDedup).toBe(false);
   });
 });
