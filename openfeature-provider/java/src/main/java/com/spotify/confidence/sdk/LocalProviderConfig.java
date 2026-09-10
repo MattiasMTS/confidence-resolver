@@ -11,7 +11,6 @@ public class LocalProviderConfig {
   private final HttpClientFactory httpClientFactory;
   private final boolean useRemoteMaterializationStore;
   private final int resolverPoolSize;
-  private final String encryptionKey;
   private final boolean enableApplyDedup;
   private final boolean disableExposureCollection;
 
@@ -31,7 +30,11 @@ public class LocalProviderConfig {
       ChannelFactory channelFactory,
       HttpClientFactory httpClientFactory,
       boolean useRemoteMaterializationStore) {
-    this(channelFactory, httpClientFactory, useRemoteMaterializationStore, 0);
+    this(
+        channelFactory,
+        httpClientFactory,
+        useRemoteMaterializationStore,
+        DEFAULT_RESOLVER_POOL_SIZE);
   }
 
   public LocalProviderConfig(
@@ -39,7 +42,13 @@ public class LocalProviderConfig {
       HttpClientFactory httpClientFactory,
       boolean useRemoteMaterializationStore,
       int resolverPoolSize) {
-    this(channelFactory, httpClientFactory, useRemoteMaterializationStore, resolverPoolSize, null);
+    this(
+        channelFactory,
+        httpClientFactory,
+        useRemoteMaterializationStore,
+        resolverPoolSize,
+        true,
+        false);
   }
 
   /**
@@ -62,7 +71,6 @@ public class LocalProviderConfig {
         httpClientFactory,
         useRemoteMaterializationStore,
         resolverPoolSize,
-        null,
         enableApplyDedup,
         false);
   }
@@ -72,23 +80,6 @@ public class LocalProviderConfig {
       HttpClientFactory httpClientFactory,
       boolean useRemoteMaterializationStore,
       int resolverPoolSize,
-      String encryptionKey) {
-    this(
-        channelFactory,
-        httpClientFactory,
-        useRemoteMaterializationStore,
-        resolverPoolSize,
-        encryptionKey,
-        true,
-        false);
-  }
-
-  private LocalProviderConfig(
-      ChannelFactory channelFactory,
-      HttpClientFactory httpClientFactory,
-      boolean useRemoteMaterializationStore,
-      int resolverPoolSize,
-      String encryptionKey,
       boolean enableApplyDedup,
       boolean disableExposureCollection) {
     this.channelFactory = channelFactory != null ? channelFactory : new DefaultChannelFactory();
@@ -96,7 +87,6 @@ public class LocalProviderConfig {
         httpClientFactory != null ? httpClientFactory : new DefaultHttpClientFactory();
     this.useRemoteMaterializationStore = useRemoteMaterializationStore;
     this.resolverPoolSize = resolverPoolSize > 0 ? resolverPoolSize : DEFAULT_RESOLVER_POOL_SIZE;
-    this.encryptionKey = encryptionKey;
     this.enableApplyDedup = enableApplyDedup;
     this.disableExposureCollection = disableExposureCollection;
   }
@@ -119,11 +109,6 @@ public class LocalProviderConfig {
    */
   public int getResolverPoolSize() {
     return resolverPoolSize;
-  }
-
-  /** Returns the hex-encoded AES-256 encryption key, or {@code null} if unset. */
-  public String getEncryptionKey() {
-    return encryptionKey;
   }
 
   /** Returns whether apply-event deduplication in the WASM resolver is enabled (on by default). */
@@ -149,7 +134,6 @@ public class LocalProviderConfig {
     private HttpClientFactory httpClientFactory;
     private boolean useRemoteMaterializationStore;
     private int resolverPoolSize;
-    private String encryptionKey;
     private boolean enableApplyDedup = true;
     private boolean disableExposureCollection;
 
@@ -180,12 +164,6 @@ public class LocalProviderConfig {
       return this;
     }
 
-    /** Sets the hex-encoded AES-256 encryption key for decrypting CDN state. */
-    public Builder encryptionKey(String encryptionKey) {
-      this.encryptionKey = encryptionKey;
-      return this;
-    }
-
     /**
      * Apply-event deduplication in the WASM resolver — repeated identical assignments within a
      * short TTL window are logged once. On by default. Set to false to disable.
@@ -211,7 +189,6 @@ public class LocalProviderConfig {
           httpClientFactory,
           useRemoteMaterializationStore,
           resolverPoolSize,
-          encryptionKey,
           enableApplyDedup,
           disableExposureCollection);
     }

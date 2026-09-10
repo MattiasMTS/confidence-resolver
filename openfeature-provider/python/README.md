@@ -36,22 +36,20 @@ You'll need a **client secret** from Confidence to use this provider.
 
 ## Encryption
 
-The provider supports encrypting the flag state to protect your flag rules and targeting segments at rest and in transit. The state is decrypted only when loaded into the resolver.
+The provider fetches encrypted flag state and decrypts it when loading the resolver. Pass the encryption key for your client credential when creating the provider.
 
-**📖 See the [Integration Guide: Encryption](../INTEGRATION_GUIDE.md#encryption)** for background and migration details.
+See the [Integration Guide](../INTEGRATION_GUIDE.md#encryption) for background and migration details.
 
 Pass the encryption key when creating the provider:
 
 ```python
 provider = ConfidenceProvider(
     client_secret="your-client-secret",
-    encryption_key="your-encryption-key",  # Get from Confidence Admin view
+    encryption_key="your-encryption-key",  # Required; unique to this credential
 )
 ```
 
-The encryption key is available in the [Confidence Admin view](https://app.confidence.spotify.com/admin/clients), next to your client credentials.
-
-> **⚠️ Upcoming change:** Encryption will be made **mandatory** in a future SDK release. We will communicate a timeline and migration path before legacy provider versions are affected. We strongly recommend enabling it now.
+Each client credential has a unique encryption key, available alongside it in [Confidence Admin](https://app.confidence.spotify.com/admin/clients).
 
 ## Quick Start
 
@@ -142,6 +140,7 @@ api.shutdown()
 ```python
 provider = ConfidenceProvider(
     client_secret="your-client-secret",
+    encryption_key="your-encryption-key",
     state_poll_interval=30.0,  # How often to poll for state updates (seconds)
     log_poll_interval=10.0,    # How often to flush logs (seconds)
 )
@@ -150,7 +149,7 @@ provider = ConfidenceProvider(
 ### Configuration Options
 
 - `client_secret` (str, required): The Confidence client secret for authentication.
-- `encryption_key` (str, optional): Encryption key for decrypting the flag state. Found in the [Confidence Admin view](https://app.confidence.spotify.com/admin/clients). Will be required in a future release.
+- `encryption_key` (str, required): Encryption key for decrypting the flag state. Found in the [Confidence Admin view](https://app.confidence.spotify.com/admin/clients).
 - `state_poll_interval` (float, optional): Interval in seconds between state polling updates. Defaults to 30.0.
 - `log_poll_interval` (float, optional): Interval in seconds for sending evaluation logs. Defaults to 10.0.
 - `use_remote_materialization_store` (bool, optional): Enable remote materialization storage. Defaults to False.
@@ -173,6 +172,7 @@ To turn it off and log every apply:
 ```python
 provider = ConfidenceProvider(
     client_secret="your-client-secret",
+    encryption_key="your-encryption-key",
     enable_apply_dedup=False,
 )
 ```
@@ -195,6 +195,7 @@ Enable remote materialization storage to have Confidence manage materialization 
 ```python
 provider = ConfidenceProvider(
     client_secret="your-client-secret",
+    encryption_key="your-encryption-key",
     use_remote_materialization_store=True,
 )
 ```
@@ -261,6 +262,7 @@ Pass your custom store to the provider:
 ```python
 provider = ConfidenceProvider(
     client_secret="your-client-secret",
+    encryption_key="your-encryption-key",
     materialization_store=MyMaterializationStore(),
 )
 ```
@@ -318,6 +320,7 @@ To disable exposure collection for **all** OpenFeature evaluations through this 
 ```python
 provider = ConfidenceProvider(
     client_secret="your-client-secret",
+    encryption_key="your-encryption-key",
     disable_exposure_collection=True,
 )
 ```
@@ -345,3 +348,15 @@ This is an advanced feature intended for exceptional cases. If you're considerin
 ## License
 
 Apache 2.0
+
+### Migrating to mandatory encryption
+
+`encryption_key` is now a required constructor argument. Missing, empty, or invalid
+keys fail before initialization. Supply exactly 64 hexadecimal characters; the
+provider only fetches encrypted state and never falls back to plaintext.
+
+Open [Confidence Admin → Clients](https://app.confidence.spotify.com/admin/clients),
+select your client, and find the credential used by the provider. Each credential
+has its own unique encryption key, available alongside it. Use the key paired with
+your configured client secret. Configure and verify encryption on your existing
+SDK before upgrading.

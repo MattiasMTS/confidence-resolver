@@ -110,7 +110,7 @@ class OpenFeatureLocalResolveProviderCdnFailureTest {
                     .setState(com.google.protobuf.ByteString.copyFrom(rawState))
                     .setAccount(ACCOUNT_NAME)
                     .build();
-            final byte[] responseBytes = clientState.toByteArray();
+            final byte[] responseBytes = EncryptionTestSupport.encrypt(clientState.toByteArray());
 
             exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
             exchange.getResponseHeaders().set("ETag", "\"test-etag\"");
@@ -166,7 +166,8 @@ class OpenFeatureLocalResolveProviderCdnFailureTest {
 
     final LocalProviderConfig config =
         new LocalProviderConfig(testChannelFactory, testHttpClientFactory);
-    return new OpenFeatureLocalResolveProvider(config, FLAG_CLIENT_SECRET);
+    return new OpenFeatureLocalResolveProvider(
+        config, FLAG_CLIENT_SECRET, EncryptionTestSupport.KEY);
   }
 
   @AfterEach

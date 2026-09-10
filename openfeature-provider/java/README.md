@@ -39,24 +39,18 @@ You'll need a **client secret** from Confidence to use this provider.
 
 ## Encryption
 
-The provider supports encrypting the flag state to protect your flag rules and targeting segments at rest and in transit. The state is decrypted only when loaded into the resolver.
+The provider fetches encrypted flag state and decrypts it when loading the resolver. Pass the encryption key for your client credential when creating the provider.
 
-**📖 See the [Integration Guide: Encryption](../INTEGRATION_GUIDE.md#encryption)** for background and migration details.
+See the [Integration Guide](../INTEGRATION_GUIDE.md#encryption) for background and migration details.
 
-Pass the encryption key via `LocalProviderConfig`:
+Pass both credentials to the provider constructor:
 
 ```java
-LocalProviderConfig config = LocalProviderConfig.builder()
-    .encryptionKey("your-encryption-key") // Get from Confidence Admin view
-    .build();
-
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider(config, "your-client-secret");
+    new OpenFeatureLocalResolveProvider("your-client-secret", "your-encryption-key");
 ```
 
-The encryption key is available in the [Confidence Admin view](https://app.confidence.spotify.com/admin/clients), next to your client credentials.
-
-> **⚠️ Upcoming change:** Encryption will be made **mandatory** in a future SDK release. We will communicate a timeline and migration path before legacy provider versions are affected. We strongly recommend enabling it now.
+Each client credential has a unique encryption key, available alongside it in [Confidence Admin](https://app.confidence.spotify.com/admin/clients).
 
 ## Quick Start
 
@@ -68,7 +62,7 @@ import dev.openfeature.sdk.MutableContext;
 
 // Create and register the provider
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider("your-client-secret"); // Get from Confidence dashboard
+    new OpenFeatureLocalResolveProvider("your-client-secret", "your-encryption-key"); // Get from Confidence dashboard
 OpenFeatureAPI.getInstance().setProviderAndWait(provider); // Important: use setProviderAndWait()
 
 // Get a client
@@ -140,16 +134,15 @@ OpenFeatureAPI.getInstance().shutdown();
 
 ### Provider Configuration
 
-Use `LocalProviderConfig.builder()` to configure the provider:
+Pass the client secret and encryption key to the constructor. Use `LocalProviderConfig.builder()` for optional settings:
 
 ```java
 LocalProviderConfig config = LocalProviderConfig.builder()
-    .encryptionKey("your-encryption-key") // Encryption key for decrypting flag state (will be required in a future release)
     .resolverPoolSize(4) // Number of WASM resolver instances (default: 2). Increase for higher concurrency.
     .build();
 
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider(config, "your-client-secret");
+    new OpenFeatureLocalResolveProvider(config, "your-client-secret", "your-encryption-key");
 ```
 
 ### Environment Variables
@@ -196,7 +189,7 @@ ChannelFactory mockFactory = (target, interceptors) ->
 
 LocalProviderConfig config = new LocalProviderConfig(mockFactory);
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider(config, "client-secret");
+    new OpenFeatureLocalResolveProvider(config, "client-secret", "your-encryption-key");
 ```
 
 This is particularly useful for:
@@ -261,7 +254,7 @@ By default, materializations are not supported. If a flag requires materializati
 ```java
 // Default behavior - no materialization support
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider("your-client-secret");
+    new OpenFeatureLocalResolveProvider("your-client-secret", "your-encryption-key");
 ```
 
 #### 2. Remote Materialization Store
@@ -275,7 +268,7 @@ LocalProviderConfig config = LocalProviderConfig.builder()
     .build();
 
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider(config, "your-client-secret");
+    new OpenFeatureLocalResolveProvider(config, "your-client-secret", "your-encryption-key");
 ```
 
 **⚠️ Important Performance Impact**: This option fundamentally changes how the provider operates:
@@ -298,6 +291,7 @@ MaterializationStore store = new RedisMaterializationStore(jedisPool);
 OpenFeatureLocalResolveProvider provider = new OpenFeatureLocalResolveProvider(
     new LocalProviderConfig(),
     "your-client-secret",
+    "your-encryption-key",
     store
 );
 ```
@@ -324,7 +318,7 @@ import com.spotify.confidence.sdk.FlagResolverService;
 
 // Create and initialize the provider
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider("your-client-secret");
+    new OpenFeatureLocalResolveProvider("your-client-secret", "your-encryption-key");
 // If you're not using OpenFeature, don't forget to call provider.initialize()
 OpenFeatureAPI.getInstance().setProviderAndWait(provider);
 
@@ -476,7 +470,7 @@ To disable exposure collection for **all** OpenFeature evaluations through this 
 ```java
 LocalProviderConfig config = LocalProviderConfig.builder().disableExposureCollection(true).build();
 OpenFeatureLocalResolveProvider provider =
-    new OpenFeatureLocalResolveProvider(config, clientSecret);
+    new OpenFeatureLocalResolveProvider(config, clientSecret, encryptionKey);
 ```
 
 To skip exposure collection for a single evaluation, pass `_confidence_skip_apply` in the evaluation context:
@@ -505,3 +499,22 @@ This is an advanced feature intended for exceptional cases. If you're considerin
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+### Migrating to mandatory encryption
+
+`encryptionKey` is now required when constructing the provider. Supply exactly 64
+hexadecimal characters. Missing, empty, or malformed keys fail before network
+activity. The provider only fetches encrypted state and never falls back to plaintext.
+
+Open [Confidence Admin → Clients](https://app.confidence.spotify.com/admin/clients),
+select your client, and locate the credential used by the provider. Each credential
+has its own unique encryption key, available alongside it. Use the key paired with
+your configured client secret. Configure and verify encryption on your existing
+SDK before upgrading.
+
+All public provider constructors take the encryption key immediately after the
+client secret, including `new OpenFeatureLocalResolveProvider(clientSecret, encryptionKey)`
+and `new OpenFeatureLocalResolveProvider(config, clientSecret, encryptionKey)`.
+Move existing `.encryptionKey(key)` configuration into the provider constructor.
+`LocalProviderConfig` contains optional settings only. Constructors accepting
+injected state are package-private.

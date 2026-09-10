@@ -167,8 +167,8 @@ var (
 	_ openfeature.Tracker         = (*LocalResolverProvider)(nil)
 )
 
-// NewLocalResolverProvider creates a new LocalResolverProvider
-func NewLocalResolverProvider(
+// newLocalResolverProvider creates a new LocalResolverProvider
+func newLocalResolverProvider(
 	resolverSupplier LocalResolverSupplier,
 	stateProvider StateProvider,
 	flagLogger FlagLogger,

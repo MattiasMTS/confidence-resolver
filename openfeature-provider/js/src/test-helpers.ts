@@ -1,4 +1,5 @@
-import { vi } from 'vitest';
+import { createCipheriv, createDecipheriv, KeyObject } from 'node:crypto';
+import { afterEach, beforeEach, vi } from 'vitest';
 import { abortableSleep, isObject, TimeUnit } from './util';
 import { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { ClientResolverState } from './proto/confidence/flags/admin/v1/resolver';
@@ -138,11 +139,13 @@ class CdnServerMock extends ServerMock {
   readonly state: EndpointMock;
   constructor() {
     const state = new EndpointMock(() =>
-      ClientResolverState.encode({
-        state: new Uint8Array(100), // Empty state for testing
-        account: '<account>',
-        logDestinations: [],
-      }).finish(),
+      encryptTestState(
+        ClientResolverState.encode({
+          state: new Uint8Array(100), // Empty state for testing
+          account: '<account>',
+          logDestinations: [],
+        }).finish(),
+      ),
     );
     // CDN serves state at any path (using client secret as path)
     super({
@@ -210,9 +213,14 @@ export async function advanceTimersUntil(...args: any[]): Promise<any> {
   } else {
     let done = false;
     ret = args[0];
-    ret.finally(() => {
-      done = true;
-    });
+    ret.then(
+      () => {
+        done = true;
+      },
+      () => {
+        done = true;
+      },
+    );
     predicate = () => done;
   }
 
@@ -287,4 +295,37 @@ export async function sha256Hex(input: string): Promise<string> {
   }
   // Pad to 64 hex chars (SHA-256 size)
   return Math.abs(hash).toString(16).padStart(64, '0');
+}
+
+export const TEST_ENCRYPTION_KEY = '00'.repeat(32);
+export function encryptTestState(data: Uint8Array): Uint8Array<ArrayBuffer> {
+  const nonce = Buffer.alloc(12);
+  const cipher = createCipheriv('aes-256-gcm', Buffer.from(TEST_ENCRYPTION_KEY, 'hex'), nonce);
+  return new Uint8Array(Buffer.concat([nonce, cipher.update(data), cipher.final(), cipher.getAuthTag()]));
+}
+
+/** Keep native crypto workers from racing fake clocks; real-timer tests use WebCrypto. */
+export function useFakeTimerCompatibleCrypto(): void {
+  const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+  let restore: () => void;
+  beforeEach(() => {
+    const spy = vi.spyOn(crypto.subtle, 'decrypt').mockImplementation(async (algorithm, key, data) => {
+      if (!vi.isFakeTimers()) return decrypt(algorithm, key, data);
+      const params = algorithm as AesGcmParams;
+      if (params.name !== 'AES-GCM') throw new Error('Only AES-GCM is supported by the fake-timer adapter');
+      const bytes = (value: BufferSource) =>
+        ArrayBuffer.isView(value) ? Buffer.from(value.buffer, value.byteOffset, value.byteLength) : Buffer.from(value);
+      const ciphertext = bytes(data);
+      const tagLength = (params.tagLength ?? 128) / 8;
+      const decipher = createDecipheriv('aes-256-gcm', KeyObject.from(key), bytes(params.iv), {
+        authTagLength: tagLength,
+      });
+      if (params.additionalData) decipher.setAAD(bytes(params.additionalData));
+      decipher.setAuthTag(ciphertext.subarray(-tagLength));
+      const plaintext = Buffer.concat([decipher.update(ciphertext.subarray(0, -tagLength)), decipher.final()]);
+      return new Uint8Array(plaintext).buffer;
+    });
+    restore = () => spy.mockRestore();
+  });
+  afterEach(() => restore());
 }

@@ -48,9 +48,10 @@ import org.slf4j.Logger;
  *
  * <pre>{@code
  * String clientSecret = "your-application-client-secret";
+ * String encryptionKey = "your-encryption-key";
  * LocalProviderConfig config = new LocalProviderConfig();
  * OpenFeatureLocalResolveProvider provider =
- *     new OpenFeatureLocalResolveProvider(config, clientSecret);
+ *     new OpenFeatureLocalResolveProvider(config, clientSecret, encryptionKey);
  *
  * OpenFeatureAPI.getInstance().setProvider(provider);
  *
@@ -140,15 +141,16 @@ public class OpenFeatureLocalResolveProvider implements FeatureProvider {
    *
    * <pre>{@code
    * OpenFeatureLocalResolveProvider provider =
-   *     new OpenFeatureLocalResolveProvider("your-client-secret");
+   *     new OpenFeatureLocalResolveProvider("your-client-secret", "your-encryption-key");
    * OpenFeatureAPI.getInstance().setProviderAndWait(provider);
    * }</pre>
    *
    * @param clientSecret the client secret for your application, used for flag resolution
    *     authentication
+   * @param encryptionKey the 64-character hexadecimal encryption key for this client credential
    */
-  public OpenFeatureLocalResolveProvider(String clientSecret) {
-    this(new LocalProviderConfig(), clientSecret);
+  public OpenFeatureLocalResolveProvider(String clientSecret, String encryptionKey) {
+    this(new LocalProviderConfig(), clientSecret, encryptionKey);
   }
 
   /**
@@ -157,11 +159,14 @@ public class OpenFeatureLocalResolveProvider implements FeatureProvider {
    * @param config the provider configuration including optional channel factory
    * @param clientSecret the client secret for your application, used for flag resolution
    *     authentication
+   * @param encryptionKey the 64-character hexadecimal encryption key for this client credential
    */
-  public OpenFeatureLocalResolveProvider(LocalProviderConfig config, String clientSecret) {
+  public OpenFeatureLocalResolveProvider(
+      LocalProviderConfig config, String clientSecret, String encryptionKey) {
     this(
         config,
         clientSecret,
+        FlagsAdminStateFetcher.validateEncryptionKey(encryptionKey),
         config.isUseRemoteMaterializationStore()
             ? new RemoteMaterializationStore(clientSecret, config.getChannelFactory())
             : new UnsupportedMaterializationStore());
@@ -173,11 +178,12 @@ public class OpenFeatureLocalResolveProvider implements FeatureProvider {
    *
    * @param clientSecret the client secret for your application, used for flag resolution
    *     authentication
+   * @param encryptionKey the 64-character hexadecimal encryption key for this client credential
    * @param materializationStore the implementation to use for handling sticky flag resolution
    */
   public OpenFeatureLocalResolveProvider(
-      String clientSecret, MaterializationStore materializationStore) {
-    this(new LocalProviderConfig(), clientSecret, materializationStore);
+      String clientSecret, String encryptionKey, MaterializationStore materializationStore) {
+    this(new LocalProviderConfig(), clientSecret, encryptionKey, materializationStore);
   }
 
   /**
@@ -187,27 +193,25 @@ public class OpenFeatureLocalResolveProvider implements FeatureProvider {
    * @param config the provider configuration including optional channel factory
    * @param clientSecret the client secret for your application, used for flag resolution
    *     authentication
+   * @param encryptionKey the 64-character hexadecimal encryption key for this client credential
    * @param materializationStore the implementation to use for handling sticky flag resolution
    */
   public OpenFeatureLocalResolveProvider(
-      LocalProviderConfig config, String clientSecret, MaterializationStore materializationStore) {
+      LocalProviderConfig config,
+      String clientSecret,
+      String encryptionKey,
+      MaterializationStore materializationStore) {
+    FlagsAdminStateFetcher.validateEncryptionKey(encryptionKey);
     this.clientSecret = clientSecret;
     this.materializationStore = materializationStore;
     this.disableExposureCollection = config.isDisableExposureCollection();
-    if (config.getEncryptionKey() == null) {
-      log.warn(
-          "No encryptionKey provided. Falling back to unencrypted state."
-              + " An encryption key will be required in an upcoming version.");
-    }
     this.stateProvider =
-        new FlagsAdminStateFetcher(
-            clientSecret, config.getHttpClientFactory(), config.getEncryptionKey());
+        new FlagsAdminStateFetcher(clientSecret, config.getHttpClientFactory(), encryptionKey);
     final var wasmFlagLogger =
         new GrpcWasmFlagLogger(
             clientSecret, config.getChannelFactory(), config.getHttpClientFactory());
     this.flagLogger = wasmFlagLogger;
-    final Map<String, String> initLabels =
-        Map.of("encryption", String.valueOf(config.getEncryptionKey() != null));
+    final Map<String, String> initLabels = Map.of("encryption", "true");
     final int numInstances = PooledResolver.getNumInstances(config.getResolverPoolSize());
     final LocalResolver telemetryResolver =
         new ProviderTelemetryResolver(
@@ -247,7 +251,7 @@ public class OpenFeatureLocalResolveProvider implements FeatureProvider {
    * @param wasmFlagLogger the flag logger to use (e.g., CapturingWasmFlagLogger for testing)
    */
   @VisibleForTesting
-  public OpenFeatureLocalResolveProvider(
+  OpenFeatureLocalResolveProvider(
       AccountStateProvider accountStateProvider,
       String clientSecret,
       MaterializationStore materializationStore,
@@ -256,7 +260,7 @@ public class OpenFeatureLocalResolveProvider implements FeatureProvider {
   }
 
   @VisibleForTesting
-  public OpenFeatureLocalResolveProvider(
+  OpenFeatureLocalResolveProvider(
       AccountStateProvider accountStateProvider,
       String clientSecret,
       MaterializationStore materializationStore,
@@ -272,7 +276,7 @@ public class OpenFeatureLocalResolveProvider implements FeatureProvider {
   }
 
   @VisibleForTesting
-  public OpenFeatureLocalResolveProvider(
+  OpenFeatureLocalResolveProvider(
       AccountStateProvider accountStateProvider,
       String clientSecret,
       MaterializationStore materializationStore,

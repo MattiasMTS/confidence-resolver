@@ -10,7 +10,7 @@ import (
 // dependencies lazily, so nils are safe.
 func newProviderWithOptions(t *testing.T, opts ...Option) *LocalResolverProvider {
 	t.Helper()
-	return NewLocalResolverProvider(nil, nil, nil, "unit-test-secret", nil, opts...)
+	return newLocalResolverProvider(nil, nil, nil, "unit-test-secret", nil, opts...)
 }
 
 // Dedup is on by default, so a caller that never mentions it gets it.
@@ -147,12 +147,12 @@ func TestNewProviderHonoursDocumentedApplyDedupOptOut(t *testing.T) {
 	}{
 		{
 			name:      "documented opt-out disables dedup",
-			config:    ProviderConfig{ClientSecret: "unit-test-secret", DisableApplyDedup: true},
+			config:    ProviderConfig{ClientSecret: "unit-test-secret", EncryptionKey: testEncryptionKey, DisableApplyDedup: true},
 			wantDedup: false,
 		},
 		{
 			name:      "unset keeps the default on",
-			config:    ProviderConfig{ClientSecret: "unit-test-secret"},
+			config:    ProviderConfig{ClientSecret: "unit-test-secret", EncryptionKey: testEncryptionKey},
 			wantDedup: true,
 		},
 	} {

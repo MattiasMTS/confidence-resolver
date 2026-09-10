@@ -40,9 +40,9 @@ You'll need a **client secret** from Confidence to use this provider.
 
 ## Encryption
 
-The provider supports encrypting the flag state to protect your flag rules and targeting segments at rest and in transit. The state is decrypted only when loaded into the resolver.
+The provider fetches encrypted flag state and decrypts it when loading the resolver. Pass the encryption key for your client credential when creating the provider.
 
-**📖 See the [Integration Guide: Encryption](../INTEGRATION_GUIDE.md#encryption)** for background and migration details.
+See the [Integration Guide](../INTEGRATION_GUIDE.md#encryption) for background and migration details.
 
 Pass the encryption key in `ProviderConfig`:
 
@@ -53,9 +53,7 @@ provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
 })
 ```
 
-The encryption key is available in the [Confidence Admin view](https://app.confidence.spotify.com/admin/clients), next to your client credentials.
-
-> **⚠️ Upcoming change:** Encryption will be made **mandatory** in a future SDK release. We will communicate a timeline and migration path before legacy provider versions are affected. We strongly recommend enabling it now.
+Each client credential has a unique encryption key, available alongside it in [Confidence Admin](https://app.confidence.spotify.com/admin/clients).
 
 ## Quick Start
 
@@ -76,6 +74,7 @@ func main() {
     // Create provider with your client secret
     provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
         ClientSecret: "your-client-secret", // Get from Confidence dashboard
+        EncryptionKey: "your-encryption-key",
     })
     if err != nil {
         log.Fatalf("Failed to create provider: %v", err)
@@ -151,6 +150,7 @@ defer cancel()
 
 provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
     ClientSecret: "your-client-secret",
+    EncryptionKey: "your-encryption-key",
 })
 if err != nil {
     log.Fatalf("Provider initialization failed: %v", err)
@@ -180,7 +180,7 @@ The `ProviderConfig` struct contains all configuration options for the provider:
 #### Required Fields
 
 - `ClientSecret` (string): The client secret used for authentication and flag evaluation
-- `EncryptionKey` (string): Encryption key for decrypting the flag state. Found in the [Confidence Admin view](https://app.confidence.spotify.com/admin/clients). Will be required in a future release.
+- `EncryptionKey` (string, required): Encryption key for decrypting the flag state. Found in the [Confidence Admin view](https://app.confidence.spotify.com/admin/clients).
 
 #### Optional Fields
 
@@ -198,25 +198,11 @@ The `ProviderConfig` struct contains all configuration options for the provider:
 
   See [Materialization Stores](#materialization-stores) for details.
 
-#### Advanced: Testing with Custom State Provider
+#### Testing encrypted state
 
-For testing purposes only, you can provide a custom `StateProvider` and `FlagLogger` to supply resolver state and control logging behavior:
-
-```go
-// WARNING: This is for testing only. Do not use in production.
-provider, err := confidence.NewProviderForTest(ctx,
-    confidence.ProviderTestConfig{
-        StateProvider:     myCustomStateProvider,
-        FlagLogger:        myCustomFlagLogger,
-        ClientSecret:      "your-client-secret",
-        Logger:            myCustomLogger,        // Optional: custom logger
-        StatePollInterval: 30 * time.Second,      // Optional: state polling interval
-        LogPollInterval:   2 * time.Minute,       // Optional: log flushing interval
-    },
-)
-```
-
-**Important**: This configuration requires you to provide both a `StateProvider` and `FlagLogger`. For production deployments, always use `NewProvider()` with `ProviderConfig`.
+Use `NewProvider` with a test `EncryptionKey` and `TransportHooks` that route CDN
+requests to a test server serving encrypted fixtures. Keyless construction helpers
+(`NewLocalResolverProvider` and `NewProviderForTest`) are now internal.
 
 ## Apply-event deduplication
 
@@ -235,6 +221,7 @@ To turn it off and log every apply:
 ```go
 provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
     ClientSecret:      "your-client-secret",
+    EncryptionKey:     "your-encryption-key",
     DisableApplyDedup: true,
 })
 ```
@@ -334,6 +321,7 @@ func main() {
     // Enable remote materialization store
     provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
         ClientSecret: "your-client-secret",
+        EncryptionKey: "your-encryption-key",
         UseRemoteMaterializationStore: true,
     })
     if err != nil {
@@ -380,6 +368,7 @@ func main() {
 
     provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
         ClientSecret:          "your-client-secret",
+        EncryptionKey: "your-encryption-key",
         MaterializationStore: myStore,
     })
     // ...
@@ -503,6 +492,7 @@ In addition to the standard OpenFeature evaluation methods, the provider exposes
 ```go
 provider, _ := confidence.NewProvider(ctx, confidence.ProviderConfig{
     ClientSecret: "your-client-secret",
+    EncryptionKey: "your-encryption-key",
 })
 openfeature.SetProviderAndWait(provider)
 
@@ -541,6 +531,7 @@ err = provider.ApplyFlags(&resolver.ApplyFlagsRequest{
         {Flag: "flags/checkout-flow", ApplyTime: timestamppb.Now()},
     },
     ClientSecret: "your-client-secret",
+    EncryptionKey: "your-encryption-key",
     ResolveToken: resp.ResolveToken,
     SendTime:     timestamppb.Now(),
 })
@@ -565,6 +556,7 @@ logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 
 provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
     ClientSecret: "your-client-secret",
+    EncryptionKey: "your-encryption-key",
     Logger:       logger,
 })
 ```
@@ -632,6 +624,7 @@ To disable exposure collection for **all** OpenFeature evaluations through this 
 ```go
 provider, err := confidence.NewProvider(ctx, confidence.ProviderConfig{
     ClientSecret: "your-client-secret",
+    EncryptionKey: "your-encryption-key",
     DisableExposureCollection: true,
 })
 ```
@@ -658,3 +651,19 @@ This is an advanced feature intended for exceptional cases. If you're considerin
 ## License
 
 See the root `LICENSE` file.
+
+### Migrating to mandatory encryption
+
+`EncryptionKey` is now required when constructing the provider. Supply exactly 64
+hexadecimal characters. Missing, empty, or malformed keys fail before network
+activity. The provider only fetches encrypted state and never falls back to plaintext.
+
+Open [Confidence Admin → Clients](https://app.confidence.spotify.com/admin/clients),
+select your client, and locate the credential used by the provider. Each credential
+has its own unique encryption key, available alongside it. Use the key paired with
+your configured client secret. Configure and verify encryption on your existing
+SDK before upgrading.
+
+`NewFlagsAdminStateFetcher` and `NewFlagsAdminStateFetcherWithTransport` now take
+an encryption key after the client secret. All state-fetcher constructors return
+`(*FlagsAdminStateFetcher, error)`; handle configuration errors before using them.

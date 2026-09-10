@@ -31,6 +31,15 @@ class FlagsAdminStateFetcher implements AccountStateProvider {
       "https://confidence-resolver-state-cdn.spotifycdn.com/";
 
   private final String clientSecret;
+
+  static String validateEncryptionKey(String key) {
+    if (key == null || !key.matches("[0-9a-fA-F]{64}")) {
+      throw new IllegalArgumentException(
+          "encryptionKey is required and must contain exactly 64 hexadecimal characters");
+    }
+    return key;
+  }
+
   private final String encryptionKey;
   private final HttpClientFactory httpClientFactory;
   private final AtomicReference<String> etagHolder = new AtomicReference<>();
@@ -44,6 +53,7 @@ class FlagsAdminStateFetcher implements AccountStateProvider {
 
   public FlagsAdminStateFetcher(
       String clientSecret, HttpClientFactory httpClientFactory, String encryptionKey) {
+    validateEncryptionKey(encryptionKey);
     this.clientSecret = clientSecret;
     this.httpClientFactory = httpClientFactory;
     this.encryptionKey = encryptionKey;
@@ -75,7 +85,7 @@ class FlagsAdminStateFetcher implements AccountStateProvider {
 
   private void fetchAndUpdateStateIfChanged() {
     final String hash = sha256Hex(clientSecret);
-    final var cdnUrl = CDN_BASE_URL + hash + (encryptionKey != null ? ".enc" : "");
+    final var cdnUrl = CDN_BASE_URL + hash + ".enc";
     try {
       final HttpURLConnection conn = httpClientFactory.create(cdnUrl);
       final String previousEtag = etagHolder.get();
@@ -89,9 +99,7 @@ class FlagsAdminStateFetcher implements AccountStateProvider {
       try (final InputStream stream = conn.getInputStream()) {
         byte[] bytes = stream.readAllBytes();
 
-        if (encryptionKey != null) {
-          bytes = decryptAesGcm(bytes, encryptionKey);
-        }
+        bytes = decryptAesGcm(bytes, encryptionKey);
 
         final var clientState =
             com.spotify.confidence.sdk.flags.admin.v1.ClientResolverState.parseFrom(bytes);

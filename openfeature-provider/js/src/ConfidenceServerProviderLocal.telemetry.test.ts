@@ -1,3 +1,4 @@
+import { useFakeTimerCompatibleCrypto } from './test-helpers';
 import { beforeEach, expect, it, MockedObject, vi } from 'vitest';
 import { LocalResolver } from './LocalResolver';
 import { ConfidenceServerProviderLocal } from './ConfidenceServerProviderLocal';
@@ -40,6 +41,7 @@ type Internals = {
   flushAssigned(): Promise<void>;
 };
 
+useFakeTimerCompatibleCrypto();
 vi.useFakeTimers();
 
 let net: NetworkMock;
@@ -68,6 +70,7 @@ function makeProvider(eventsResponse: () => Response): ConfidenceServerProviderL
   };
   return new ConfidenceServerProviderLocal(mockedWasmResolver, singleEventTracker(), {
     flagClientSecret: 'flagClientSecret',
+    encryptionKey: '00'.repeat(32),
     fetch: fetchImpl,
   });
 }
@@ -141,6 +144,7 @@ it('drains events before the final log flush on close', async () => {
   };
   const provider = new ConfidenceServerProviderLocal(mockedWasmResolver, singleEventTracker(), {
     flagClientSecret: 'flagClientSecret',
+    encryptionKey: '00'.repeat(32),
     fetch: fetchImpl,
   });
   (provider as unknown as { eventTracker: EventTracker }).eventTracker = singleEventTracker();
@@ -186,6 +190,7 @@ it('conserves flush counters when deliveries overlap', async () => {
   };
   const provider = new ConfidenceServerProviderLocal(mockedWasmResolver, singleEventTracker(), {
     flagClientSecret: 'flagClientSecret',
+    encryptionKey: '00'.repeat(32),
     fetch: fetchImpl,
   });
 
@@ -245,6 +250,7 @@ it('does not let a hanging assign delivery delay the interval flush', async () =
   };
   const provider = new ConfidenceServerProviderLocal(mockedWasmResolver, singleEventTracker(), {
     flagClientSecret: 'flagClientSecret',
+    encryptionKey: '00'.repeat(32),
     fetch: fetchImpl,
   });
   const internals = provider as unknown as Internals;
